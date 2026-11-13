@@ -3,7 +3,7 @@
 本文是预训练之后整条链的设计：从基座模型到能对话、能评测、能发布的三档模型（small / medium / large）。
 写于 2026-11-12。
 
-**目前写好的**：所有阶段都有代码和测试，并在一个 25M 的演示模型上从头到尾跑通（`python -m tools.demo`）：
+**目前写好的**：所有阶段都有代码和测试，并在一个 2300 万参数的演示模型上从头到尾跑通（`python -m tools.demo`）：
 预训练、退火、SFT、三个领域专家、RLVR、MOPD、agent RL、RLAIF、评测。真正的三档模型要等预训练数据和 PRO 6000。
 
 ## 三档的流程
@@ -210,7 +210,7 @@ eval/suite.py      ⑧：留出文档上各类别的损失、题目正确率、�
 eval/benchmarks.py ⑧：C-Eval、CMMLU、GSM8K 的下载、转换和打分
 dataset/sft.py     后训练数据：三份 SFT 语料、三个专家的数据
 dataset/rl.py      RL 题目、评测题、MOPD 提示
-tools/demo.py      在 25M 的小模型上把整条链跑一遍
+tools/demo.py      在 2300 万参数的小模型上把整条链跑一遍
 out/<档>/<阶段>/    每个阶段的存档
 ```
 

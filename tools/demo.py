@@ -38,7 +38,7 @@ from training import train_distill, train_pretrain, train_rl, train_sft
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-# 演示用的小模型：主干 3.3M，合计约 25M（词表 32768）
+# 演示用的小模型：主干 3.3M，合计约 23M（词表 32768）
 DEMO_MODEL = dict(preset="small", dim=256, n_layers=4, n_heads=4, n_kv_heads=2, max_seq_len=1024, window=256, set=["engram_head_dim=16"])
 NANO = DATA / "pretrain_nano.parquet"
 SMALL_RL = ("agent", "instruct", "reading", "cloze")            # small 的 agent RL 一步里练的题（都是程序判分）
