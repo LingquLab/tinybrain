@@ -1,0 +1,77 @@
+"""在命令行里和模型对话：python -m inference.chat out/small/sft/ckpt.pt
+
+每次回车发一句，模型回答完接着等下一句。输入 /清空 重新开始对话，/退出 结束。
+--tools 打开基础工具（计算器、跑 Python），模型写出工具调用时会真的执行，再把结果交给它接着回答。
+"""
+import argparse
+
+import torch
+
+from training.trainer_utils import load_model, pick_device
+
+from .generate import generate
+from .template import ChatFormat
+from .tokenizer import DEFAULT_MODEL, Tokenizer
+
+
+def reply(model, fmt: ChatFormat, messages: list[dict], max_new: int = 512, temperature: float = 0.7, top_k: int | None = 50,
+          env=None, max_turns: int = 4) -> tuple[str, list[dict]]:
+    """返回 (最后的回答, 这一问里新增的消息：可能有工具调用和工具结果)。"""
+    device = next(model.parameters()).device
+    added = []
+    for _ in range(max_turns):
+        prompt = fmt.prompt(messages + added)
+        room = min(max_new, model.cfg.max_seq_len - len(prompt))
+        if room <= 0:
+            return "（对话太长了，请 /清空 重新开始）", added
+        out = generate(model, torch.tensor([prompt], device=device), room, temperature=temperature, top_k=top_k, eos_id=fmt.end)
+        text, calls, broken = fmt.parse_turn(out[0, len(prompt):].tolist())
+        added.append({"role": "assistant", "content": text, **({"tool_calls": calls} if calls else {})})
+        if not calls or env is None:
+            return text, added
+        results = [env.call(c["name"], c["arguments"]) for c in calls] + [f"工具调用格式错误：{b[:200]}" for b in broken]
+        added.append({"role": "tool", "content": "\n".join(results)})
+    return added[-1]["content"], added
+
+
+def main(argv=None, input_fn=input, print_fn=print):
+    parser = argparse.ArgumentParser(description="和模型对话")
+    parser.add_argument("ckpt")
+    parser.add_argument("--system", default="", help="系统提示")
+    parser.add_argument("--max-new", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--tools", action="store_true", help="打开计算器和 Python 工具")
+    parser.add_argument("--device", default="auto")
+    args = parser.parse_args(argv)
+    device = pick_device(args.device)
+    model = load_model(args.ckpt, device)
+    fmt = ChatFormat(Tokenizer(DEFAULT_MODEL))
+    env = None
+    if args.tools:
+        from training.rewards.tools import ToolEnv
+
+        env = ToolEnv({"tools": ["calculator", "python"]})
+    base = [{"role": "system", "content": "\n".join(x for x in (args.system, env.describe() if env else "") if x)}] if (args.system or env) else []
+    messages = list(base)
+    while True:
+        try:
+            line = input_fn("你：").strip()
+        except EOFError:
+            break
+        if line in ("/退出", "/exit"):
+            break
+        if line in ("/清空", "/clear"):
+            messages = list(base)
+            continue
+        if not line:
+            continue
+        messages.append({"role": "user", "content": line})
+        text, added = reply(model, fmt, messages, args.max_new, args.temperature, args.top_k, env)
+        messages += added
+        print_fn("模型：" + text)
+    return messages
+
+
+if __name__ == "__main__":
+    main()
