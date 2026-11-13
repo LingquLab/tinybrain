@@ -1,13 +1,5 @@
-# 数据：原始下载、洗好的、混好的都不进仓库
-data/raw/
-data/clean/
-data/mix/
-data/tokens/
-data/survey/
-data/benchmarks/
-# 做出来的数据集（四个预训练文件、后训练数据）发布在 ModelScope，不进代码仓库
-data/*.parquet
-data/*.jsonl
+# 数据（原始下载、洗好的、后训练原料、做出来的数据集）都不进仓库；数据集发布在 ModelScope
+data/
 *.tmp
 
 # 训练产物

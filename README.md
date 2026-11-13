@@ -46,7 +46,15 @@ tools/                 辅助工具，都是命令行
   demo.py                在 25M 的小模型上把整条链跑一遍
   judge_check.py         用好回答和故意弄坏的回答检查评审模型和评分细则
 tokenizer/             正式分词器（tokenizer.model、tokenizer.vocab）
-data/build/            数据集流水线：clean（单篇精洗）、books（切书）、pipeline（按来源批量洗）、mix（去重、配比、分档、写出四个文件）、posttrain（后训练数据）
+dataset/               数据流水线（tinybrain dataset）
+  sources.py             所有来源一张表：出自哪里、许可证、怎么下载、怎么取正文
+  download.py            下载原始数据
+  clean.py               单篇文档的清洗规则（含切书）
+  pretrain.py            按来源批量清洗预训练数据
+  mix.py                 去重、配比、分四档写出、检查、生成数据集说明
+  sft.py                 SFT 语料
+  rl.py                  RL 题目、评测题、MOPD 提示
+  build.py               总入口：按顺序跑各步，开跑前检查输入
 docs/                  设计文档（post-training.md：后训练流程；rlaif-rubric.md：评审的评分细则）
 ```
 
@@ -140,7 +148,7 @@ medium/large ：预训练(base 20B / full ~70B) → 退火 → SFT（各自的�
 - **鲁迅全集**做成续写题，原文当参考给评审，专门补通用语言能力。
 
 ```bash
-python -m data.build.posttrain sft && python -m data.build.posttrain prompts     # 后训练数据
+python -m dataset.build sft rl                                                 # 后训练数据（SFT 语料、RL 题目、评测题、MOPD 提示）
 python -m tools.prepare --chat --input data/sft_small.parquet --out data/tokens/sft-small --seq-len 2048
 python -m training.train_sft --init out/small/anneal/ckpt.pt --data data/tokens/sft-small --out out/small/sft --epochs 2
 python -m training.train_rl --init out/small/sft/ckpt.pt --tasks data/rl_small.parquet --out out/small/rl --judge-url http://localhost:8000/v1
@@ -162,14 +170,16 @@ python -m tools.demo --judge-url http://127.0.0.1:8080/v1     # 小模型上整�
 | nano | 1B | 按配比，每个来源取质量最高的 | 跑通流程、做小实验 |
 | mini | 5B | 同上 | small（167M） |
 | base | 20B | 同上 | medium（499M） |
-| full | 去重后的全部，约 70B | 不挑，比例跟着池子走（中文约 42%） | large（1.09B） |
+| full | 去重后的全部，60.26B | 不挑，比例跟着池子走 | large（1.09B） |
 
-最后只留下 `data/pretrain_nano.parquet`、`_mini`、`_base`、`_full` 四个文件，每个都是完整的一档、内部打乱。
+做出来是 `data/pretrain_nano.parquet`、`_mini`、`_base`、`_full` 四个文件（2.1 / 10.3 / 40.6 / 117 GB），每个都是完整的一档、内部打乱。
+token 数是正式分词器的真实 token（抽样实测）。每个来源的出处、许可证和各档用量见生成的数据集说明（`python -m dataset.mix card`）。
 
 ```bash
-python -m data.build.pipeline clean <来源> --workers 4    # 洗一个来源
-python -m data.build.pipeline audit <来源>                # 抽查洗出来的结果
-python -m data.build.mix index && python -m data.build.mix plan && python -m data.build.mix write
+python -m dataset.build --check              # 每一步要什么、有没有、会产出什么
+python -m dataset.build                      # 从头做：download → clean → mix → sft → rl
+python -m dataset.download wiki_zh --list    # 只看某个来源会下哪些文件
+python -m dataset.pretrain audit <来源>       # 抽查洗出来的结果
 ```
 
-来源、各自的许可和取正文的方式都登记在 `data/build/pipeline.py` 的 `SOURCES` 里；配比在 `data/build/mix.py` 的 `MIX` 里。
+来源、各自的许可、下载方式和取正文的方式都登记在 `dataset/sources.py` 里；配比在 `dataset/mix.py` 的 `MIX` 里。

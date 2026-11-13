@@ -1,10 +1,10 @@
 """把洗好的各个来源混成最终数据集：去重 → 按配比和质量挑选 → 分档 → 写成四个文件 → 检查。
 
-    python -m data.build.mix index    # 读所有洗好的文件，跨来源去重，记下每篇的质量和长度
-    python -m data.build.mix plan     # 按配比算出每个来源每一档取多少，打印成表
-    python -m data.build.mix write    # 写出 data/pretrain_nano.parquet、_mini、_base、_full 四个文件
-    python -m data.build.mix verify   # 检查这四个文件，报告写到 out/mix/verify.json
-    python -m data.build.mix card     # 按检查报告生成数据集说明 out/mix/README.md（发布到 ModelScope / Hugging Face 用）
+    python -m dataset.mix index    # 读所有洗好的文件，跨来源去重，记下每篇的质量和长度
+    python -m dataset.mix plan     # 按配比算出每个来源每一档取多少，打印成表
+    python -m dataset.mix write    # 写出 data/pretrain_nano.parquet、_mini、_base、_full 四个文件
+    python -m dataset.mix verify   # 检查这四个文件，报告写到 out/mix/verify.json
+    python -m dataset.mix card     # 按检查报告生成数据集说明 out/mix/README.md（发布到 ModelScope / Hugging Face 用）
 
 四档是套娃关系：nano ⊂ mini ⊂ base ⊂ full。每个来源内部按质量从高到低排，最好的进 nano，往下依次进 mini、base；
 full 是去重后的全部。
@@ -22,7 +22,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data.build.pipeline import CLEAN, ROOT, SOURCES
+from dataset.sources import CLEAN, PRETRAIN, ROOT
 
 MIX_DIR = ROOT / "data" / "mix"   # 中间结果：索引、计划、分桶
 FINAL_DIR = ROOT / "data"          # 最后只留下 data/pretrain_<档>.parquet 这四个文件
@@ -261,7 +261,7 @@ def write_tiers(seed: int = 0, buckets: int = 256, flush_bytes: int = 4 << 20, o
     for name in plan_table:
         d = np.load(MIX_DIR / "index" / f"{name}.npz")
         tier = np.load(MIX_DIR / "index" / f"{name}.tier.npy")
-        spec = SOURCES[name]
+        spec = PRETRAIN[name]
         category = next(c for c, (_, sources) in MIX.items() if name in sources)
         for fi, path in enumerate(_source_files(name)):
             rows = np.flatnonzero((d["file_id"] == fi) & (tier >= 0) & (tier <= max_t))
@@ -388,7 +388,7 @@ def dataset_card(report: dict) -> str:
     sources 是每个来源的篇数，source_tokens 是每个来源的估算 token 数。"""
     tiers = [t for t in TIERS if t in report]
     cat_of = {s: c for c, (_, sources) in MIX.items() for s in sources}
-    unclear = [s for s in cat_of if "待确认" in SOURCES.get(s, {}).get("license", "") and any(report[t]["source_tokens"].get(s) for t in tiers)]
+    unclear = [s for s in cat_of if "待确认" in PRETRAIN.get(s, {}).get("license", "") and any(report[t]["source_tokens"].get(s) for t in tiers)]
     lines = ["---", "license: other", "language:", "- zh", "- en", "task_categories:", "- text-generation", "tags:", "- pretraining", "---", "",
              "# tinybrain dataset", "",
              "tinybrain 的中文为主的混合预训练数据集。", "",
@@ -414,14 +414,14 @@ def dataset_card(report: dict) -> str:
         for src in sources:
             if not any(report[t]["source_tokens"].get(src) for t in tiers):
                 continue
-            spec = SOURCES.get(src, {})
+            spec = PRETRAIN.get(src, {})
             cells = " | ".join(f"{report[t]['source_tokens'].get(src, 0) / 1e9:.3f}" for t in tiers)
             lines.append(f"| {src} | {c} | {spec.get('upstream', '')} | {spec.get('license', '')} | {cells} |")
     lines += ["", "## 许可", "", SOURCE_LICENSE_NOTE]
     if unclear:
         lines += ["", f"许可证待确认的来源：{'、'.join(unclear)}。"]
     lines += ["", "## 怎么做的", "",
-              "1. 清洗（`data/build/clean.py`、`pipeline.py`）：修乱码、统一标点和空白，去掉太短、不成句、语言不对、广告、重复太多、有屏蔽字的文档；"
+              "1. 清洗（`dataset/clean.py`、`dataset/pretrain.py`；来源见 `dataset/sources.py`）：修乱码、统一标点和空白，去掉太短、不成句、语言不对、广告、重复太多、有屏蔽字的文档；"
               "手机号、身份证号、邮箱换成占位符；古籍和书按章节切成篇。",
               "2. 去重（`mix.py index`）：每篇取最长的 3 句当指纹，跨来源有 2 句撞上就算重复，按来源的优先级留一篇（整理过的来源优先于网页抓取）。",
               "3. 分档（`mix.py plan`、`write`）：按配比算出每个来源每档取多少，来源内部按质量从高到低取。",

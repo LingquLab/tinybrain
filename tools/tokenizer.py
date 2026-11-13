@@ -4,9 +4,9 @@
     python -m tools.tokenizer train --vocab 32768              # 训练 → out/tokenizer/sp32768.model
     python -m tools.tokenizer eval out/tokenizer/sp32768.model # 各类文本上一个词平均几个字
 
-样本直接从原始文件现洗（和 data.build.pipeline 同一套清洗），所以还没整批洗完的来源也能用。
+样本直接从原始文件现洗（和 dataset/pretrain.py 同一套清洗），所以还没整批洗完的来源也能用。
 每个来源只读少数几个分片（默认 3 个，在文件列表里均匀地取，大来源的不同子来源都能碰到），每个分片读开头的一部分。
-配比按估算的 token 数算，和 data.build.mix 的 MIX 一致；还没下载的来源跳过，份额在同类里补上。
+配比按估算的 token 数算，和 dataset/mix.py 的 MIX 一致；还没下载的来源跳过，份额在同类里补上。
 
 训练的设置：
   - 不做任何归一化、不加前导空格、不合并连续空格：解码回来和原文一字不差（代码缩进、全角标点都保住）。
@@ -21,13 +21,14 @@ from pathlib import Path
 
 import sentencepiece as spm
 
-from data.build import pipeline
-from data.build.clean import clean_with_reason, est_tokens
-from data.build.mix import MIX, allocate
+from dataset import pretrain
+from dataset.clean import clean_with_reason, est_tokens
+from dataset.mix import MIX, allocate
+from dataset.sources import PRETRAIN, ROOT
 
 from inference.tokenizer import BOS, CONTROL, DEFAULT_MODEL, EOS, PAD, UNK, VOCAB_SIZE, Tokenizer  # noqa: F401  正式分词器在推理包里
 
-OUT = pipeline.ROOT / "out" / "tokenizer"   # 训练分词器用的样本（不进仓库）
+OUT = ROOT / "out" / "tokenizer"   # 训练分词器用的样本（不进仓库）
 MAX_LINE = 4000  # 训练样本里一行最多多少字，更长的切开（SentencePiece 默认跳过太长的句子）
 # 字符覆盖率：出现频率排在最后这么一点的字不进词表、只能拆成字节。0.9995 时「刨、榈、栾、卞、锑」这类常用字都被排除了，所以取得更高。
 COVERAGE = 0.99995
@@ -36,8 +37,8 @@ COVERAGE = 0.99995
 def available_sources() -> set[str]:
     """已经下载好、至少有一个能读的原始文件的来源。"""
     found = set()
-    for name, spec in pipeline.SOURCES.items():
-        if (pipeline.RAW / spec.get("raw", name)).is_dir() and pipeline.raw_files(name):
+    for name, spec in PRETRAIN.items():
+        if (pretrain.RAW / spec.get("raw", name)).is_dir() and pretrain.raw_files(name):
             found.add(name)
     return found
 
@@ -63,8 +64,8 @@ def pick_shards(files: list, n: int) -> list:
 
 def iter_clean_docs(name: str, path: Path, max_rows: int):
     """一个原始文件里洗好的文档（只读前 max_rows 行）。"""
-    spec = pipeline.SOURCES[name]
-    rows = pipeline.iter_rows(path)
+    spec = PRETRAIN[name]
+    rows = pretrain.iter_rows(path)
     rows = spec["regroup"](rows) if spec.get("regroup") else rows
     for i, row in enumerate(rows):
         if i >= max_rows:
@@ -96,7 +97,7 @@ def sample_corpus(total_tokens: float, out_dir: Path = OUT, shards: int = 3, hol
             if budget <= 0:
                 continue
             category = next(c for c, (_, srcs) in MIX.items() if name in srcs)
-            files = pick_shards(pipeline.raw_files(name), shards)
+            files = pick_shards(pretrain.raw_files(name), shards)
             got = dict(category=category, budget=int(budget), tokens=0, chars=0, docs=0, heldout=0, shards=[f.name for f in files])
             for path in files:
                 target = got["tokens"] + budget / len(files)

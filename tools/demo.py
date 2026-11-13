@@ -9,14 +9,14 @@
   anneal     退火：九成预训练数据 + 一成对话格式的数据（整段算损失）
   sft        SFT（small 的语料）
   ── small 的路线 ──
-  agent      agent RL（基础工具调用）
+  agent      agent RL（基础工具调用），同时练指令跟随、中文阅读、诗词填空
   rlaif      RLAIF（评审模型打分：通用、写作、诗词）
   ── medium / large 的路线（这里用同一个小模型代替）──
   experts    数学、代码、文学三个专家，各自在领域数据上接着 SFT
-  rlvr       数学专家做 RLVR（对答案）
+  rlvr       数学专家做 RLVR（数学题对答案、逻辑题）
   rlvr_code  代码专家做 RLVR（跑测试用例）
   mopd       MOPD：学生 = SFT 模型，老师 = 三个专家（通用题的老师是 SFT 模型自己）
-  mopd_agent MOPD 之后的 agent RL
+  mopd_agent MOPD 之后的 RL：工具调用、科学选择题、指令跟随、中文阅读、诗词填空
   mopd_rlaif 最后的 RLAIF
   eval       给每个阶段的存档做评测，汇总成一张表
 
@@ -31,7 +31,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data.build.mix import MIX
+from dataset.mix import MIX
 from eval import suite
 from tools.prepare import prepare, prepare_chat
 from training import train_distill, train_pretrain, train_rl, train_sft
@@ -41,6 +41,9 @@ DATA = ROOT / "data"
 # 演示用的小模型：主干 3.3M，合计约 25M（词表 32768）
 DEMO_MODEL = dict(preset="small", dim=256, n_layers=4, n_heads=4, n_kv_heads=2, max_seq_len=1024, window=256, set=["engram_head_dim=16"])
 NANO = DATA / "pretrain_nano.parquet"
+SMALL_RL = ("agent", "instruct", "reading", "cloze")            # small 的 agent RL 一步里练的题（都是程序判分）
+EXPERT_RL = {"math": ("math", "logic"), "code": ("code",)}      # 两个专家各自的 RLVR
+AFTER_MOPD_RL = ("agent", "choice", "instruct", "reading", "cloze")
 STAGES = ("sample", "pretrain", "anneal", "sft", "agent", "rlaif", "experts", "rlvr", "rlvr_code", "mopd", "mopd_agent", "mopd_rlaif", "eval")
 
 
@@ -62,8 +65,8 @@ def nano_sample(out: Path, tokens: float, nano: Path = NANO) -> dict:
 
 def pretrain_sample(out: Path, tokens: float, seed: int = 0) -> dict:
     """从 data/clean 里已经洗完的来源，按 MIX 的类别比例取文档，写成一个 parquet。没洗完的来源跳过，份额由同类别或别的类别补。"""
-    from data.build.clean import est_tokens
-    from data.build.mix import REAL_PER_EST, allocate
+    from dataset.clean import est_tokens
+    from dataset.mix import REAL_PER_EST, allocate
 
     clean = DATA / "clean"
     ready = {p.name for p in clean.iterdir() if (p / "_stats.json").exists()}
@@ -155,7 +158,7 @@ def run(out: Path, tokens: float = 80e6, judge_url: str = "", judge_model: str =
     rl_small = DATA / "rl_small.parquet"
     if want("agent") and not done("agent"):
         stage("agent")
-        tasks = subset(rl_small, out / "tasks_agent.parquet", lambda r: r["reward"] == "agent")
+        tasks = subset(rl_small, out / "tasks_agent.parquet", lambda r: r["reward"] in SMALL_RL)
         log["agent"] = train_rl.main(argv(init=out / "sft" / "ckpt.pt", tasks=tasks, out=out / "agent", steps=30, max_turns=3, **{**rl_common, "judge_url": ""}))
     if want("rlaif") and judge_url and not done("rlaif"):
         stage("rlaif")
@@ -169,12 +172,12 @@ def run(out: Path, tokens: float = 80e6, judge_url: str = "", judge_model: str =
                                                            steps=300, warmup_steps=10, save_every=300, **sft_common))
     if want("rlvr") and not done("rlvr"):
         stage("rlvr")
-        tasks = subset(DATA / "rl_large.parquet", out / "tasks_math.parquet", lambda r: r["reward"] == "math")
+        tasks = subset(DATA / "rl_large.parquet", out / "tasks_math.parquet", lambda r: r["reward"] in EXPERT_RL["math"])
         log["rlvr"] = train_rl.main(argv(init=out / "expert_math" / "ckpt.pt", tasks=tasks, out=out / "rlvr", steps=20,
                                          **{**rl_common, "max_new": 256, "judge_url": ""}))
     if want("rlvr_code") and not done("rlvr_code"):
         stage("rlvr_code")
-        tasks = subset(DATA / "rl_large.parquet", out / "tasks_code.parquet", lambda r: r["reward"] == "code")
+        tasks = subset(DATA / "rl_large.parquet", out / "tasks_code.parquet", lambda r: r["reward"] in EXPERT_RL["code"])
         if pq.read_metadata(tasks).num_rows:
             log["rlvr_code"] = train_rl.main(argv(init=out / "expert_code" / "ckpt.pt", tasks=tasks, out=out / "rlvr_code", steps=10,
                                                   **{**rl_common, "max_new": 384, "judge_url": ""}))
@@ -187,9 +190,7 @@ def run(out: Path, tokens: float = 80e6, judge_url: str = "", judge_model: str =
                                               max_new=160, device=device, save_every=40))
     if want("mopd_agent") and not done("mopd_agent"):
         stage("mopd_agent")
-        tasks = out / "tasks_agent.parquet"
-        if not tasks.exists():
-            subset(rl_small, tasks, lambda r: r["reward"] == "agent")
+        tasks = subset(DATA / "rl_large.parquet", out / "tasks_after_mopd.parquet", lambda r: r["reward"] in AFTER_MOPD_RL)
         log["mopd_agent"] = train_rl.main(argv(init=out / "mopd" / "ckpt.pt", tasks=tasks, out=out / "mopd_agent", steps=30, max_turns=3,
                                                **{**rl_common, "judge_url": ""}))
     if want("mopd_rlaif") and judge_url and not done("mopd_rlaif"):

@@ -1,34 +1,28 @@
-"""精洗流水线：把 data/raw/<来源>/ 里的原始文件洗成 data/clean/<来源>/ 里的 parquet。
+"""所有数据来源一张表：预训练（PRETRAIN）、SFT（SFT）、RL 的原始数据（RL_INPUTS）和其他要下载的东西（EXTRA）。
 
-    python -m data.build.pipeline clean fw22_4_5 --workers 10 [--limit 100]
-    python -m data.build.pipeline audit fw22_4_5 [--docs 30]
+每个来源写清楚：出自哪个数据集、许可证、怎么下载（download），预训练来源还写怎么从原始的一行里取出正文。
+下载见 dataset/download.py，清洗见 dataset/pretrain.py。
 
-clean 可以重复运行，洗过的文件会跳过。audit 用来人工检查：随机抽几篇看开头和结尾，
-统计最常重复出现的行（多半是没洗掉的网页外壳），以及各种可疑痕迹出现的比例。
+download 的写法（都会固定到具体的文件，重跑得到同样的数据）：
+    ms=仓库, prefix=目录, limit=最多几个文件          ModelScope 上某个目录下的文件（不往下找子目录），按文件名排序取前 limit 个
+    ms=仓库, prefixes={目录: 个数, …}                  同一个仓库的几个目录各取几个
+    hf=仓库, pattern=正则                              Hugging Face（走 hf-mirror）上文件名匹配的全部文件
+    hf=仓库, paths=[文件, …]                           Hugging Face 上指定的几个文件
+    urls=[(地址, 存成的文件名), …]                     直接下载
+    rows=N                                             （SFT）只要前 N 条对话，转成统一格式
+    bytes=N                                            只下文件开头 N 字节（文件很大、只用开头一段时）
 """
-
-import argparse
-import collections
-import csv
-import fnmatch
-import gzip
-import io
-import json
-import random
 import re
-import time
-from multiprocessing import Pool
 from pathlib import Path
+from urllib.parse import quote
 
-import pyarrow as pa
 import pyarrow.parquet as pq
 
-from data.build.clean import clean_with_reason, unwrap_lines
-from data.build.books import split_book, strip_gutenberg
+from dataset.clean import split_book, strip_gutenberg, unwrap_lines
 
-ROOT = Path(__file__).resolve().parents[2]
-RAW, CLEAN = ROOT / "data" / "raw", ROOT / "data" / "clean"
-DROPPED_PER_FILE = 15  # 每个原始文件留几篇被丢掉的文档，供人工检查
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data"
+RAW, CLEAN, INPUTS = DATA / "raw", DATA / "clean", DATA / "inputs"   # 原始下载、洗好的预训练数据、后训练的原料
 
 
 def _text(row):
@@ -222,9 +216,9 @@ def _poem(row):
     return f"{title}\n{era}·{author}\n{body}" if body else ""
 
 
-# 每个来源：种类、类别、怎么从一行里取正文（一行可以给出多篇）；regroup 可以先把原始的行重新分组、怎么取自带的质量分（换算到 0 到 1 左右）、是否去 Markdown、
-# 出自哪个数据集（upstream；下载脚本是 dl_queue.sh、dl_hf.sh、dl_books.sh）、许可（照上游写的；「待确认」是上游没写清楚）
-SOURCES = {
+# 预训练的来源：种类、类别、怎么从一行里取正文（一行可以给出多篇）；regroup 可以先把原始的行重新分组、怎么取自带的质量分（换算到 0 到 1 左右）、
+# 是否去 Markdown、出自哪个数据集（upstream）、许可（照上游写的；「待确认」是上游没写清楚）、怎么下载（download，见 dataset/download.py）
+PRETRAIN = {
     "fw22_4_5": dict(kind="zh", category="文章", text=_text, score=_num("score"), upstream="opencsg/Fineweb-Edu-Chinese-V2.2（4_5 分档）", license="apache-2.0"),
     "fw22_3_4": dict(kind="zh", category="文章", text=_text, score=_num("score"), upstream="opencsg/Fineweb-Edu-Chinese-V2.2（3_4 分档，前 150 个文件）", license="apache-2.0"),
     "ultrafineweb_en": dict(kind="en", category="英文网页", text=_field("content"), score=_num("score"), upstream="openbmb/Ultra-FineWeb（英文，前 10 个文件）", license="apache-2.0"),
@@ -253,178 +247,104 @@ SOURCES = {
     "udstack_v3_l2": dict(kind="code", category="代码", text=_field("content"), score=_num("quality_score", 10.0), upstream="openbmb/UltraData-Stack-v3-L2（Python 2、C++ 1、Java 1 个文件）", license="odc-by"),
 }
 
-RAW_SUFFIXES = (".parquet", ".jsonl.gz", ".json.gz", ".jsonl", ".json", ".zst", ".csv", ".txt")
 
-SCHEMA = pa.schema([("text", pa.string()), ("quality", pa.float32()), ("heuristic", pa.float32()), ("est_tokens", pa.int32()),
-                    ("n_chars", pa.int32()), ("sigs", pa.list_(pa.uint64())), ("row", pa.int32())])
+_POETRY_COMMIT = "https://raw.githubusercontent.com/Werneror/Poetry/4cfe49c06858e00d15f84d192fe5294295f79689/"
+_POETRY_FILES = ("元 元末明初 先秦 南北朝 唐 唐末宋初 宋_1 宋_2 宋_3 宋_4 宋末元初 宋末金初 当代 明_1 明_2 明_3 明_4 明末清初 民国末当代初 汉 清_1 清_2 "
+                 "清末民国初 清末近现代初 秦 辽 近现代 近现代末当代初 金 金末元初 隋 隋末唐初 魏晋 魏晋末南北朝初").split()
+_ANY = r"\.(parquet|jsonl|json)$"
 
+# 预训练来源怎么下载（下到 data/raw/<来源>/）。gutenberg_en_zh 和 gutenberg_en 用同一份原始文件。
+PRETRAIN_DOWNLOAD = {
+    "fw22_4_5": dict(ms="opencsg/Fineweb-Edu-Chinese-V2.2", prefix="4_5"),
+    "fw22_3_4": dict(ms="opencsg/Fineweb-Edu-Chinese-V2.2", prefix="3_4", limit=150),
+    "ultrafineweb_en": dict(ms="openbmb/Ultra-FineWeb", prefix="data/ultrafineweb_en", limit=10),
+    "wiki_zh": dict(ms="wikimedia/wikipedia", prefix="20231101.zh"),
+    "wiki_en": dict(ms="wikimedia/wikipedia", prefix="20231101.en"),
+    "cosmopedia_zh": dict(ms="opencsg/chinese-cosmopedia", prefix="data", limit=3),
+    "law": dict(hf="twang2218/chinese-law-and-regulations", pattern=r"\.parquet$"),
+    "gujilab": dict(hf="gujilab/chinese-classical-corpus", paths=["corpus.jsonl"]),
+    "wikisource_zh": dict(ms="wikimedia/wikisource", prefix="20231201.zh"),
+    "greathangpt": dict(hf="kenpusney/greathangpt-classical-chinese", pattern=r"all\.parquet$"),
+    "shu": dict(hf="shjwudp/shu", paths=["clean_text.jsonl.gz"]),
+    "baidu_baike": dict(hf="lars1234/baidu-baike-dataset", pattern=_ANY),
+    "poetry": dict(urls=[(_POETRY_COMMIT + quote(f"{n}.csv"), f"{n}.csv") for n in _POETRY_FILES]),
+    "luxun": dict(ms="SkyContact/TheCompleteWorksOfLuXun", prefix="data"),
+    "gutenberg_en": dict(ms="common-pile/project_gutenberg", prefix="v0/documents"),
+    "gutenberg_zh": dict(hf="manu/project_gutenberg", paths=["data/zh-00000-of-00001-bca42330c6f1826c.parquet"]),
+    "numinamath": dict(ms="AI-MO/NuminaMath-1.5", prefix="data"),
+    "nemotron_math": dict(ms="nv-community/Nemotron-Pretraining-Specialized-v1", prefix="Nemotron-Pretraining-Math-Textbooks", limit=2),
+    "finemath": dict(ms="HuggingFaceTB/finemath", prefix="finemath-4plus", limit=8),
+    "ifm_math_rewrite": dict(ms="IFM/Math-Reasoning", prefix="math-rewrite", limit=2),
+    "udmath_l2": dict(ms="openbmb/UltraData-Math", prefix="data/UltraData-Math-L2-preview", limit=6),
+    "arxiv": dict(ms="common-pile/arxiv_papers", prefix="", limit=6),
+    "pes2o": dict(ms="allenai/peS2o", prefix="data/v3", limit=2),
+    "udcode_l2": dict(ms="openbmb/UltraData-Code", prefixes={f"data/UltraData-Code-L2/{k}": n for k, n in
+                                                            (("py", 4), ("cpp", 2), ("java", 1), ("js", 1), ("go", 1), ("rust", 1))}),
+    "udstack_v3_l2": dict(ms="openbmb/UltraData-Stack-v3-L2", prefixes={f"data/UltraData-Stack-v3-L2/{k}": n for k, n in (("python", 2), ("cpp", 1), ("java", 1))}),
+}
+assert set(PRETRAIN_DOWNLOAD) | {"gutenberg_en_zh"} == set(PRETRAIN), "每个预训练来源都要写怎么下载"
+for _name, _how in PRETRAIN_DOWNLOAD.items():
+    PRETRAIN[_name]["download"] = _how
 
-def iter_rows(path: Path):
-    """逐行读原始文件：parquet、csv、每行一个 JSON 的文本（可以是 gz、zst 压缩的），或者整个当成一行的 txt。"""
-    name = path.name.lower()
-    if name.endswith(".csv"):
-        with open(path, encoding="utf-8", newline="") as f:
-            yield from csv.DictReader(f)
-        return
-    if name.endswith(".txt"):
-        yield {"text": path.read_text(encoding="utf-8")}
-        return
-    if name.endswith(".parquet"):
-        for batch in pq.ParquetFile(path).iter_batches(batch_size=500):
-            yield from batch.to_pylist()
-        return
-    if name.endswith(".gz"):
-        f = gzip.open(path, "rt", encoding="utf-8")
-    elif name.endswith(".zst"):
-        import zstandard
+# SFT 的来源：领域、许可、放进哪几档、出自哪里、怎么下载（固定到上游的具体文件，取前 10 万条，转成统一的对话格式，存到 data/inputs/sft/<名字>.jsonl）
+_ALL = ("small", "medium", "large")
+SFT = {
+    "smoltalk_zh": dict(domain="通用", license="apache-2.0", tiers=_ALL, upstream="opencsg/smoltalk-chinese",
+                        download=dict(ms="opencsg/smoltalk-chinese", paths=["advice-seeking.parquet"])),
+    "chinese_instruct": dict(domain="通用", license="cc-by-sa-4.0", tiers=_ALL, upstream="Mxode/Chinese-Instruct",
+                             download=dict(hf="Mxode/Chinese-Instruct", paths=["Chinese-QA-AFAF/Chinese-QA-AFAF.jsonl"])),
+    "coig_cqia": dict(domain="通用", license="见原项目", tiers=_ALL, upstream="m-a-p/COIG-CQIA",
+                      download=dict(ms="m-a-p/COIG-CQIA", paths=["COIG-CQIA-full.jsonl"])),
+    "deepctrl": dict(domain="通用", license="见原项目", tiers=_ALL, upstream="deepctrl/deepctrl-sft-data（中文部分）",
+                     download=dict(ms="deepctrl/deepctrl-sft-data", paths=["sft_data_zh.jsonl"])),
+    "ying_k1": dict(domain="通用", license="cc-by-4.0", tiers=_ALL, upstream="Karasumikura/Ying-K1-SFT-Chinese-NonThink-102K",
+                    download=dict(hf="Karasumikura/Ying-K1-SFT-Chinese-NonThink-102K", paths=["data/train.jsonl"])),
+    "infinity": dict(domain="通用", license="cc-by-sa-4.0", tiers=_ALL, upstream="BAAI/Infinity-Instruct（0625）",
+                     download=dict(ms="BAAI/Infinity-Instruct", paths=["0625/train-00000-of-00007.parquet"])),
+    "smol_smoltalk": dict(domain="通用", license="apache-2.0", tiers=_ALL, upstream="HuggingFaceTB/smol-smoltalk",
+                          download=dict(ms="HuggingFaceTB/smol-smoltalk", paths=["data/test-00000-of-00001.parquet"])),
+    "dolci_instruct": dict(domain="通用", license="odc-by", tiers=_ALL, upstream="allenai/Dolci-Instruct-SFT",
+                           download=dict(ms="allenai/Dolci-Instruct-SFT", paths=["data/train-00000-of-00015.parquet"])),
+    "toolace": dict(domain="工具调用", license="apache-2.0", tiers=_ALL, upstream="Team-ACE/ToolACE",
+                    download=dict(ms="mlabonne/ToolACE", paths=["data/train-00000-of-00001.parquet"])),
+    "ud_agent_tool": dict(domain="工具调用", license="apache-2.0", tiers=("medium", "large"), upstream="openbmb/UltraData-SFT-Agent-2609（工具部分）",
+                          download=dict(ms="openbmb/UltraData-SFT-Agent-2609", paths=["data/Tool_Use/Tool_Use_part-1-of-9.jsonl"])),
+    "opc_sft": dict(domain="代码", license="mit", tiers=_ALL, upstream="OpenCoder-LLM/opc-sft-stage2",
+                    download=dict(ms="AI-ModelScope/opc-sft-stage2", paths=["educational_instruct/train-00000-of-00001.parquet"])),
+    "numina_cot": dict(domain="数学", license="apache-2.0", tiers=_ALL, upstream="AI-MO/NuminaMath-CoT",
+                       download=dict(ms="AI-MO/NuminaMath-CoT", paths=["data/train-00000-of-00005.parquet"])),
+    "r1_zh_110k": dict(domain="通用", license="apache-2.0", tiers=_ALL, upstream="Congliu/Chinese-DeepSeek-R1-Distill-data-110k",
+                       download=dict(ms="AI-ModelScope/Chinese-DeepSeek-R1-Distill-data-110k", paths=["distill_r1_110k.jsonl"])),
+    "openscience_zh": dict(domain="通用", license="cc-by-4.0", tiers=("medium", "large"), upstream="zake7749/OpenScience-Chinese-Reasoning-SFT",
+                           download=dict(ms="zake7749/OpenScience-Chinese-Reasoning-SFT", paths=["data/train-00000-of-00001.parquet"])),
+    "am_qwen3": dict(domain="通用", license="见原项目", tiers=("large",), upstream="a-m-team/AM-Qwen3-Distilled（code 部分）",
+                     download=dict(ms="a-m-team/AM-Qwen3-Distilled", paths=["code.jsonl"])),
+    "nemotron_if": dict(domain="通用", license="cc-by-4.0 等", tiers=("medium", "large"), upstream="nvidia/Nemotron-SFT-Instruction-Following-Chat-v3",
+                        download=dict(ms="nv-community/Nemotron-SFT-Instruction-Following-Chat-v3", paths=["data/chat.jsonl"])),
+    "nemotron_math_sft": dict(domain="数学", license="cc-by-4.0", tiers=("large",), upstream="nvidia/Nemotron-SFT-Math-v4",
+                              download=dict(ms="nv-community/Nemotron-SFT-Math-v4", paths=["data/train-00000-of-00012.parquet"])),
+    "nemotron_cp": dict(domain="代码", license="cc-by-4.0 等", tiers=("large",), upstream="nvidia/Nemotron-SFT-Competitive-Programming-v2",
+                        download=dict(ms="nv-community/Nemotron-SFT-Competitive-Programming-v2", paths=["data/competitive_programming_cpp_00.jsonl"])),
+}
+for _spec in SFT.values():
+    _spec["download"]["rows"] = 100_000
 
-        f = io.TextIOWrapper(zstandard.ZstdDecompressor().stream_reader(open(path, "rb")), encoding="utf-8")
-    else:
-        f = open(path, encoding="utf-8")
-    with f:
-        for line in f:
-            if line.strip():
-                yield json.loads(line)
-
-
-def raw_files(name: str) -> list[Path]:
-    """这个来源要洗的原始文件：认得的格式，不是下划线开头的清单，没在下载中，并且符合来源自己限定的文件名（files 通配，skip 正则排除）。"""
-    pattern, skip = SOURCES[name].get("files", "*"), SOURCES[name].get("skip")
-    return sorted(p for p in (RAW / SOURCES[name].get("raw", name)).iterdir()
-                  if p.name.lower().endswith(RAW_SUFFIXES) and not p.name.startswith("_")
-                  and fnmatch.fnmatch(p.name, pattern) and not (skip and re.search(skip, p.name))
-                  and not p.with_name(p.name + ".aria2").exists())
-
-
-WRITE_EVERY = 50_000  # 攒够这么多篇就写出一组，大文件（比如十几 GB 的百科）也不会全压在内存里
-
-
-def process_file(job) -> dict:
-    """洗一个原始文件，写出一个 parquet 和一份被丢文档的小样。返回统计。"""
-    name, in_path, out_path = job
-    spec = SOURCES[name]
-    stats = collections.Counter()
-    cols = {field: [] for field in SCHEMA.names}
-    dropped = []
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_suffix(".tmp")
-    writer = pq.ParquetWriter(tmp, SCHEMA, compression="zstd")
-
-    def flush():
-        writer.write_table(pa.table(cols, schema=SCHEMA))
-        for v in cols.values():
-            v.clear()
-
-    rows = iter_rows(Path(in_path))
-    for i, row in enumerate(spec["regroup"](rows) if spec.get("regroup") else rows):
-        raws = spec["text"](row)
-        score = spec["score"](row) if spec.get("score") else None
-        for raw in [raws] if isinstance(raws, str) else raws:  # 一行可以给出多篇，比如一本书切成的各篇
-            doc, reason = clean_with_reason(raw, spec["kind"], native_score=score, markdown=spec.get("markdown", False))
-            stats["读入"] += 1
-            stats["读入字符"] += len(raw)
-            if doc is None:
-                stats["丢:" + reason] += 1
-                if len(dropped) < DROPPED_PER_FILE:
-                    dropped.append({"reason": reason, "text": raw[:1500]})
-                continue
-            stats["保留"] += 1
-            stats["保留字符"] += doc["n_chars"]
-            stats["保留token"] += doc["est_tokens"]
-            for field in SCHEMA.names:
-                cols[field].append(i if field == "row" else doc[field])
-            if len(cols["text"]) >= WRITE_EVERY:
-                flush()
-    flush()
-    writer.close()
-    tmp.rename(out_path)  # 写完整了才改名，中断不会留下半个文件
-    (out_path.parent / "_dropped").mkdir(exist_ok=True)
-    with open(out_path.parent / "_dropped" / (out_path.stem + ".jsonl"), "w", encoding="utf-8") as f:
-        for d in dropped:
-            f.write(json.dumps(d, ensure_ascii=False) + "\n")
-    return dict(stats)
-
-
-def clean_source(name: str, workers: int, limit: int | None = None) -> dict:
-    files = raw_files(name)[:limit]
-    out_name = lambda p: p.name[:-len(next(x for x in RAW_SUFFIXES if p.name.lower().endswith(x)))] + ".parquet"
-    jobs = [(name, str(p), str(CLEAN / name / out_name(p))) for p in files if not (CLEAN / name / out_name(p)).exists()]
-    print(f"{name}：{len(files)} 个原始文件，其中 {len(jobs)} 个待洗，用 {workers} 个进程", flush=True)
-    total, start = collections.Counter(), time.time()
-    with Pool(workers) as pool:
-        for done, stats in enumerate(pool.imap_unordered(process_file, jobs), 1):
-            total.update(stats)
-            if done % max(1, len(jobs) // 20) == 0 or done == len(jobs):
-                print(f"  {done}/{len(jobs)} 个文件，保留 {total['保留'] / max(1, total['读入']):.1%}，"
-                      f"{total['保留token'] / 1e9:.2f}B token，{time.time() - start:.0f}s", flush=True)
-    summary = dict(total)
-    if jobs:
-        (CLEAN / name / "_stats.json").write_text(json.dumps(summary, ensure_ascii=False, indent=1), encoding="utf-8")
-        reasons = {k[2:]: f"{v / total['读入']:.2%}" for k, v in sorted(total.items(), key=lambda kv: -kv[1]) if k.startswith("丢:")}
-        print(f"完成：读入 {total['读入']} 篇，保留 {total['保留']} 篇（{total['保留'] / total['读入']:.1%}），丢弃原因 {reasons}，"
-              f"字符减少 {1 - total['保留字符'] / total['读入字符']:.1%}", flush=True)
-    return summary
-
-
-SUSPECTS = {
-    "网址": r"https?://|www\.", "来源编辑类": r"(来源|编辑|记者|作者|通讯员)[:：]", "转载声明": r"转载|版权|免责", "引导点击": r"点击(查看|进入|下载|这里|阅读)|扫码|二维码|关注(我们|公众号|微信)|长按识别",
-    "联系方式": r"电话|QQ|微信|<手机号>|<邮箱>", "图片残留": r"图\s?\d|\(图\)|图片来源|如图所示|【图", "翻页残留": r"上一[篇页]|下一[篇页]|阅读全文|查看更多|展开全文",
-    "省略截断": r"(\.\.\.|…)\s*$", "方括号标记": r"\[[^\]]{1,12}\]", "乱码痕迹": r"&nbsp;|&amp;|&#\d+;|\\u[0-9a-f]{4}|\\n|�", "HTML标签": r"</?[a-zA-Z][^>]{0,40}>", "星号": r"\*{2,}",
+# RL 题目的原始数据（下到 data/inputs/rl/<名字>/，文件名里的「/」换成「__」）；怎么出题见 dataset/rl.py
+RL_INPUTS = {
+    "deepscaler": dict(license="mit", download=dict(ms="agentica-org/DeepScaleR-Preview-Dataset", pattern=r"deepscaler\.json$")),
+    "bigmath": dict(license="apache-2.0", download=dict(ms="SynthLabsAI/Big-Math-RL-Verified", pattern=r"\.parquet$")),
+    "deepcoder": dict(license="mit", download=dict(ms="agentica-org/DeepCoder-Preview-Dataset", pattern=r"(/train-.*|^codeforces/.*)\.parquet$")),
+    "ifeval": dict(license="odc-by", download=dict(ms="allenai/RLVR-IFeval", pattern=r"\.parquet$")),
+    "cmrc2018": dict(license="cc-by-sa-4.0", download=dict(ms="hfl/cmrc2018", pattern=r"\.parquet$")),
+    "arc": dict(license="cc-by-sa-4.0", download=dict(ms="allenai/ai2_arc", pattern=r"\.parquet$")),
+    "gsm8k_zh": dict(license="mit", download=dict(hf="meta-math/GSM8K_zh", paths=["GSM8K_zh.json"])),
+    "openscience": dict(license="cc-by-4.0", download=dict(hf="nvidia/OpenScience", paths=["OS-Q2.5-32B-4.jsonl"], bytes=50 << 20)),
 }
 
-
-def audit(name: str, n_docs: int = 30, max_files: int = 40, seed: int = 0) -> dict:
-    """抽查洗好的结果。返回 {docs, frequent_lines, suspects, dropped}，同时打印出来。"""
-    rnd = random.Random(seed)
-    files = sorted((CLEAN / name).glob("*.parquet"))
-    files = rnd.sample(files, min(max_files, len(files)))
-    texts = [t for f in files for t in pq.read_table(f, columns=["text"]).column("text").to_pylist()]
-    line_docs = collections.Counter()
-    for t in texts:
-        for line in {l.strip() for l in t.split("\n") if 2 <= len(l.strip()) <= 60}:
-            line_docs[line] += 1
-    frequent = [(line, c) for line, c in line_docs.most_common(60) if c >= max(3, len(texts) // 2000)]
-    found = {k: [(t, m) for t in texts for m in [re.search(rx, t)] if m] for k, rx in SUSPECTS.items()}
-    suspects = {k: len(v) / len(texts) for k, v in found.items()}
-    docs = rnd.sample(texts, min(n_docs, len(texts)))
-    dropped = [json.loads(l) for f in files for l in open(f.parent / "_dropped" / (f.stem + ".jsonl"), encoding="utf-8")]
-    print(f"=== {name}：抽查 {len(files)} 个文件，{len(texts)} 篇")
-    print("--- 可疑痕迹出现在多少比例的文档里：" + "；".join(f"{k} {v:.1%}" for k, v in suspects.items()))
-    for k, hits in found.items():  # 每种痕迹看几个真实例子，才知道是该洗的还是正常内容
-        for t, m in rnd.sample(hits, min(5, len(hits))):
-            print(f"   [{k}] …" + t[max(0, m.start() - 30):m.end() + 30].replace("\n", " ⏎ ") + "…")
-    print("--- 重复出现最多的行（行 × 出现的文档数）：")
-    for line, c in frequent:
-        print(f"   {c:6d}  {line}")
-    print("--- 随机抽的文档（开头 ……… 结尾）：")
-    for t in docs:
-        flat = t.replace("\n", " ⏎ ")
-        print("  ·", flat[:230], "………", flat[-170:] if len(flat) > 420 else "")
-    by_reason = collections.defaultdict(list)
-    for d in dropped:
-        by_reason[d["reason"]].append(d["text"])
-    print("--- 被丢掉的文档（每种原因抽几篇）：")
-    for reason, items in by_reason.items():
-        for t in rnd.sample(items, min(4, len(items))):
-            print(f"  [{reason}]", t[:200].replace("\n", " ⏎ "))
-    return {"docs": docs, "frequent_lines": frequent, "suspects": suspects, "dropped": dropped}
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="数据集精洗流水线")
-    parser.add_argument("command", choices=["clean", "audit"])
-    parser.add_argument("source", choices=list(SOURCES))
-    parser.add_argument("--workers", type=int, default=10)
-    parser.add_argument("--limit", type=int, default=None, help="只处理前几个原始文件")
-    parser.add_argument("--docs", type=int, default=30, help="audit 时抽几篇文档")
-    parser.add_argument("--seed", type=int, default=0, help="audit 的随机种子，换一个就换一批文档")
-    args = parser.parse_args(argv)
-    if args.command == "clean":
-        clean_source(args.source, args.workers, args.limit)
-    else:
-        audit(args.source, args.docs, seed=args.seed)
-
-
-if __name__ == "__main__":
-    main()
+# 其他：PG-19 的验证集和测试集（只为拿到要从古腾堡里排除的书号）；古籍库的文白互译（SFT 文学数据只用开头几千条）
+EXTRA = {
+    "pg19_heldout": dict(dest=RAW / "pg19_heldout", download=dict(hf="emozilla/pg19", paths=["data/test-00000-of-00001-29a571947c0b5ccc.parquet",
+                                                                                         "data/validation-00000-of-00001-0f92e2337f79aeac.parquet"])),
+    "gujilab_translate": dict(dest=INPUTS, download=dict(hf="gujilab/chinese-classical-corpus", paths=["translate.jsonl"], bytes=40 << 20,
+                                                         save_as="gujilab_translate.jsonl")),
+}

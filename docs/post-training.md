@@ -95,7 +95,7 @@ medium/large ：① 预训练(base 20B / full ~70B) → ② 退火 → ③ SFT�
 做法参考 MOPD（ICML 2026），小米 MiMo-V2-Flash、DeepSeek-V4 用的也是这个思路。
 
 1. **学生**：③ 的通用模型。
-2. **路由**：每条提示带一个领域标签（代码、数学、文学、通用），按标签找对应的专家当老师；通用题的老师是 ③ 自己，起到不让学生跑偏的作用。
+2. **路由**：每条提示带一个领域标签，按标签找同名的专家当老师（代码、数学、文学、通用；通用题的老师是 ③ 自己，起到不让学生跑偏的作用）。没有单独专家的领域按路由表交给别的老师：逻辑 → 数学；阅读、诗词、写作、古文 → 文学；指令跟随、科学、工具调用 → 通用（`training/train_distill.py` 的 `ROUTES`，`--route 领域=老师` 可以改）。提示是 SFT 语料里的问题加上全部 RL 题。
 3. **生成**：学生自己采样出回答。
 4. **打分**：把「提示 + 学生的回答」送进那个专家，得到专家在每个位置的概率分布。
 5. **损失**：每个回答位置上，学生对老师的反向 KL，即 KL(学生 ‖ 老师)。专家和学生同尺寸、用同一个词表，所以算的是全词表上的精确值。
@@ -103,24 +103,39 @@ medium/large ：① 预训练(base 20B / full ~70B) → ② 退火 → ③ SFT�
 
 显存方面，large 用 bf16 时五个专家加一个学生不到 15 GB。
 
-### ⑥ RL：一套训练器，三种奖励
+### ⑥ RL：一套训练器，奖励可插拔
 
-RLVR、agent RL、RLAIF 用同一个训练器，只是奖励从哪来不同。
+RLVR、agent RL、RLAIF 用同一个训练器（`training/train_rl.py`），只是题目和奖励不同。题库由 `dataset/rl.py` 生成：
+
+| 题型（reward） | 判分 | 来源 | 数量 | 用在 |
+|---|---|---|---|---|
+| math | 对最终答案 | Big-Math-RL-Verified（挑 Llama 8B 解题率 0.2–0.95 的）、DeepScaleR（竞赛题）、GSM8K_zh（中文） | 约 3 万 | medium、large |
+| code | 沙箱里跑测试用例 | DeepCoder-Preview 的训练集；评测用它的 Codeforces 部分 | 约 2.4 万 | medium、large |
+| logic | reasoning-gym 自带的判分 | reasoning-gym 现场生成：算术、数列、24 点、Countdown、骑士与无赖、小数独等 33 种 | 约 1 万 | medium、large |
+| choice | 选项字母对不对 | ARC、OpenScience | 约 1.2 万 | medium、large |
+| instruct | 程序检查约束（字数、段落、编号、关键词、开头结尾、JSON……），满足的比例 | RLVR-IFeval（英文）；给留出的中文问题加中文约束 | 约 1 万 | 三档 |
+| reading | 和参考答案按字算 F1 | CMRC2018 | 约 1 万 | 三档 |
+| cloze | 和标准答案完全一样 | 从诗词里出：给作者、题目、上句，写下句 | 约 5000 | 三档 |
+| agent | 答案对不对；工具调用格式坏一次扣 0.1 | 程序生成：大数运算、百分比、取模、日期、在维基资料里检索（一跳、两跳） | 约 5000 | 三档 |
+| judge | 评审模型按评分细则打分 | 留出的通用问题；鲁迅续写（带原文参考） | 约 7000 | 三档 |
+| poetry | 格律 × 0.4 + 评审 × 0.6 | 真实诗题 | 约 2000 | 三档 |
+
+评测题从每种题里先留出一份（共约 700 道），和 RL、SFT 都不重复；RL 和评测用到的通用问题来自 SFT 留出的 2%（`dataset/sft.py`），模型在 SFT 时没见过。
 
 - **算法**：GRPO，用 Dr. GRPO 的修正，去掉原版偏向长回答的偏差。
 - **流程**：每条提示采样一组回答，组内比较奖励，算每个回答的优势值，再做策略梯度。
 
 | | 用在哪 | 奖励从哪来 | 要准备的 |
 |---|---|---|---|
-| **RLVR** | medium、large 的数学、代码专家 | 判分器：数学对最终答案，代码跑测试用例 | 有标准答案的数学题；带测试的编程题；代码沙箱 |
-| **agent RL** | small 在 SFT 之后；medium、large 在 MOPD 之后 | 环境：最后的答案对不对，工具调用格式坏一次扣 0.1 | 自己做的基础工具（计算器、跑 Python、在给定资料里检索）和两类任务（大数运算、在几篇维基里查年份）。large 以后接小米开源的环境（见下） |
-| **RLAIF** | 三档的最后一步 | 评审模型按中文评分细则打分（有用、准确、安全、格式） | 评审模型、评分细则、一批覆盖各领域的提示 |
+| **RLVR** | medium、large 的数学专家（math、logic）、代码专家（code）；MOPD 之后再做一轮 choice | 程序判分 | 上表的程序判分题；代码沙箱 |
+| **agent RL** | small 在 SFT 之后（同时练 instruct、reading、cloze）；medium、large 在 MOPD 之后 | 环境和程序判分 | 自己做的基础工具（计算器、跑 Python、在给定资料里检索）。large 以后接小米开源的环境（见下） |
+| **RLAIF** | 三档的最后一步 | 评审模型按中文评分细则打分（有用、准确、安全、格式） | 评审模型、评分细则、judge 和 poetry 题 |
 
 - **题目难度**：RLVR 和 agent RL 都按通过率挑题，留下通过率在 10%–90% 的，并逐步加难。
 - **small 上的 RL**：小模型 RL 的证据本来就弱（MobileLLM-R1：十亿参数以下，SFT 之后再加 RL 没有明显提升）。所以 small 只用 RL 磨最基础的东西：调对工具、格式对、回答得体。前提是 SFT 语料里有足够的工具调用示范。
 
 **agent RL 的环境**：
-- 第一版用自己做的基础工具环境（`training/rewards/tools.py`），任务由 `data.build.posttrain` 生成，small 也能练。
+- 第一版用自己做的基础工具环境（`training/rewards/tools.py`），任务由 `dataset/rl.py` 生成，small 也能练。
 - 小米开源了 MiMo-V2.6 的 RL 环境（`XiaomiMiMo/MiMo-V2.6-RL-oss`，Apache-2.0：软件工程、漏洞复现、知识工作、网页开发、作曲）、
   训练框架（他们 fork 的 verl）和智能体外壳（mimoagent、uni-agent）。这些任务对我们的尺寸太难，
   而且 verl 要求 Hugging Face 格式和 vLLM 推理，我们的结构两样都不支持。所以先不接训练框架；以后给模型做一个
@@ -193,7 +208,8 @@ inference/
   chat.py          命令行里和模型对话（--tools 打开工具）
 eval/suite.py      ⑧：留出文档上各类别的损失、题目正确率、评审打分、固定提问的回答，可选加上标准基准
 eval/benchmarks.py ⑧：C-Eval、CMMLU、GSM8K 的下载、转换和打分
-data/build/posttrain.py   后训练数据：三份 SFT 语料、三个专家的数据、MOPD 提示、RL 题目、评测题
+dataset/sft.py     后训练数据：三份 SFT 语料、三个专家的数据
+dataset/rl.py      RL 题目、评测题、MOPD 提示
 tools/demo.py      在 25M 的小模型上把整条链跑一遍
 out/<档>/<阶段>/    每个阶段的存档
 ```
@@ -204,12 +220,15 @@ out/<档>/<阶段>/    每个阶段的存档
 - `data/sft_{small,medium,large}.parquet`：三份 SFT 语料；
 - `data/sft_expert_{math,code,literature}.parquet`：三个专家的数据；
 - `data/mopd_prompts.parquet`：MOPD 的提示，带领域；
-- `data/rl_{small,medium,large}.parquet`：RL 题目（agent、评审、诗词、鲁迅续写；medium、large 另有数学）；
-- `data/eval_tasks.parquet`：评测题，和 RL 题目不重叠。
+- `data/sft_heldout.parquet`：从 SFT 留出的 2% 问题，给 RL 和评测出题；
+- `data/rl_{small,medium,large}.parquet`：RL 题目（题型见 ⑥）；
+- `data/eval_tasks.parquet`：评测题，和 RL 题目、SFT 都不重叠。
+
+原料在 `data/inputs/`（`python -m dataset.download sft rl extra`）：`sft/`（SFT 来源，每个前 10 万条）、`rl/`（RL 题目的原始数据）、`gujilab_translate.jsonl`。
 
 ## 还缺的
 
-1. 外部 SFT 数据现在是每个来源前若干条（`data/survey/sft_full/`），全量的下载和转换还没做；UltraData-SFT-2605 要登录申请，没拿到。
+1. 外部 SFT 数据现在是每个来源前 10 万条（`data/inputs/sft/`，`python -m dataset.download sft`），全量的下载和转换还没做；UltraData-SFT-2605 要登录申请，没拿到。
 2. 代码 RLVR 的题目来自 DeepCoder-Preview（带测试用例），接好了，演示里跑通了；题目还偏难，小模型基本拿不到分。
 3. OpenAI 兼容的服务接口已经有了（`inference/serve.py`），还没真的接小米的 mimoagent 跑一遍。
 4. CUDA 上的快速生成（CUDA graph）要在 PRO 6000 上用 `python -m tools.bench … --generate` 实测。
@@ -225,7 +244,7 @@ out/<档>/<阶段>/    每个阶段的存档
 
 ## 附录：SFT 数据的取舍（2026-11-13 抽样后）
 
-每个来源先抽 1000 条看指标和内容（`data/survey/sample_sft.py`），用得上的再取前 10 万条。
+每个来源先抽 1000 条看指标和内容，用得上的再取前 10 万条（具体文件见 `dataset/sources.py` 的 `SFT`）。
 
 | 数据集 | 用在 | 说明 |
 |---|---|---|

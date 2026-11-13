@@ -12,13 +12,15 @@
 
 题目数据（parquet，一行一道题）：
     messages   提示，[{role, content}]，不含要模型写的回答
-    reward     math / code / poetry / judge / agent
-    answer     math、agent 用的标准答案
+    reward     math / code / poetry / judge / agent / choice / reading / cloze / instruct / logic
+    answer     math、agent、choice、cloze 用的标准答案；reading 是参考答案的 JSON 列表
     tests      code 用的测试（Python assert）
     form       poetry 的体裁（五绝、七绝、五律、七律）
     domain     judge、poetry 用的评分领域（通用、写作、古文、诗词）
     reference  judge 可选的参考答案（比如鲁迅续写的原文）
     tools、documents   agent 题能用的工具和检索资料
+    constraints  instruct 题的约束（JSON 列表，见 training/rewards/instruct.py）
+    gym、entry   logic 题的题型名和生成时的那一条（reasoning-gym）
 全部参数见文件末尾的 parse_args。
 """
 import argparse
@@ -34,8 +36,12 @@ import torch
 from inference.template import ChatFormat
 from inference.tokenizer import DEFAULT_MODEL, Tokenizer
 
+from .rewards import choice as choice_reward
 from .rewards import code as code_reward
+from .rewards import instruct as instruct_reward
 from .rewards import judge as judge_mod
+from .rewards import logic as logic_reward
+from .rewards import match as match_reward
 from .rewards import math as math_reward
 from .rewards import poetry as poetry_reward
 from .rewards import tools as tool_reward
@@ -44,7 +50,11 @@ from .rollout import Episode, collate, keep_fitting, run_agent, sample_group, to
 from .trainer_utils import (add_optimizer_args, autocast, load_model, optimizers_from_args, pick_device, save_checkpoint, set_lr_scale,
                             setup_device, step_optimizers)
 
-KINDS = ("math", "code", "poetry", "judge", "agent")
+# 程序判分的题：奖励函数 reward(episode, task) -> 0 到 1
+PROGRAM_REWARDS = {"math": math_reward.reward, "code": code_reward.reward, "agent": tool_reward.reward, "choice": choice_reward.reward,
+                   "reading": match_reward.reading_reward, "cloze": match_reward.cloze_reward, "instruct": instruct_reward.reward,
+                   "logic": logic_reward.reward}
+KINDS = tuple(PROGRAM_REWARDS) + ("poetry", "judge")  # 后两种要评审模型
 
 
 def load_tasks(path: str) -> list[dict]:
@@ -68,12 +78,8 @@ def score(tasks: list[dict], groups: list[list[Episode]], judge=None, meter_weig
     for ti, (task, group) in enumerate(zip(tasks, groups)):
         kind = task["reward"]
         for ei, ep in enumerate(group):
-            if kind == "math":
-                rewards[ti][ei] = math_reward.reward(ep, task)
-            elif kind == "code":
-                rewards[ti][ei] = code_reward.reward(ep, task)
-            elif kind == "agent":
-                rewards[ti][ei] = tool_reward.reward(ep, task)
+            if kind in PROGRAM_REWARDS:
+                rewards[ti][ei] = PROGRAM_REWARDS[kind](ep, task)
             else:
                 domain = task.get("domain") or ("诗词" if kind == "poetry" else "通用")
                 pending.append((ti, ei, last_user(task["messages"]), ep.text, domain, task.get("reference")))
