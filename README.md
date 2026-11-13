@@ -1,16 +1,85 @@
 # tinybrain
 
-从零搭一个小型中文语言模型，外加一套自己做预训练数据集的流水线。思路上参考 MiniMind 和 nanochat，结构上换成了更新的几样东西。
+**从一个字开始，自己做一个中文大模型。**
 
-**现状**：模型、预训练、整套后训练（SFT、MOPD、RLVR、agent RL、RLAIF）和评测都写完并有测试，在一个 25M 的演示模型上整条链跑通过；数据清洗在进行中；分词器定为 32768 词的 SentencePiece（`tokenizer/tokenizer.model`）。CUDA 上的路径（半精度、编译、分块窗口注意力）目前只在 CPU 上验证过数值正确，还没有在显卡上跑过。
+60B token 开源中文数据 · 自己训的分词器 · 预训练到强化学习的全流程 · 专门为古文和诗词练过
+
+tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https://github.com/jingyaogong/minimind)、[nanochat](https://github.com/karpathy/nanochat) 一样，所有代码都是自己写的、能一行行读懂；不一样的是：
+
+- **数据也从零做**：从 26 个公开来源下载、清洗、跨来源去重、按配比和质量分成四档（1B / 5B / 20B / 60B token），这套数据叫 **tinybrain dataset**，做数据的每一步代码都在 `dataset/` 里。
+- **结构用新东西**：多流残差（mHC）、Engram 查表记忆、3:1 的滑动窗口注意力、可选的混合专家（MoE），优化器是 Muon。
+- **后训练做全套**：SFT → 领域专家 → 多老师在线蒸馏（MOPD）→ 强化学习（RLVR、agent RL、RLAIF），10 种题型、各自的判分器。
+- **以中文为主**：分词器、数据配比、评分细则都按中文定，另外专门放了古文、诗词、鲁迅全集。
+
+> **现状（2026-11-13）**：模型、数据流水线、四档预训练数据、整套后训练（SFT、MOPD、RL）和评测都写完了，有测试；
+> 在一个 2500 万参数的演示模型上，用最终的数据把整条链（预训练 → 退火 → SFT → agent RL → RLAIF → 专家 → RLVR → MOPD → 评测）跑通过。
+> **还没有在显卡上正式训练过**：small 训一遍要多久、能力怎么样，都还没测。CUDA 上的路径（bf16、编译、分块窗口注意力、CUDA graph）只在 CPU 上验证过数值正确。
+
+---
 
 ## 目录
 
+- [快速开始](#快速开始)
+- [代码结构](#代码结构)
+- [模型](#模型)
+- [分词器](#分词器)
+- [数据集：tinybrain dataset](#数据集tinybrain-dataset)
+- [预训练](#预训练)
+- [后训练](#后训练)
+- [评测](#评测)
+- [推理](#推理)
+- [演示结果](#演示结果)
+- [还没做的](#还没做的)
+- [参考](#参考)
+
+---
+
+## 快速开始
+
+```bash
+git clone https://github.com/cai114514114514/tinybrain && cd tinybrain
+pip install -e ".[data]"          # 要 Python 3.11+、PyTorch 2.5+（用 PyTorch 自带的 Muon 要 2.9+）
 ```
-lm/                    只放模型的定义（一个文件一个概念）
+
+**1. 拿到数据**（二选一）
+
+```bash
+# 直接下做好的（ModelScope，整理中，传完后公开）
+modelscope download --dataset caiwangzsnm/tinybrain-dataset pretrain_mini.parquet --local_dir data
+
+# 或者自己从头做：下载 → 清洗 → 去重分档 → SFT 语料 → RL 题目
+python -m dataset.build --check   # 先看每一步要什么、有没有
+python -m dataset.build
+```
+
+**2. 预训练一个 small**
+
+```bash
+python -m tools.prepare --input data/pretrain_mini.parquet --out data/tokens/mini        # 切词
+python -m training.train_pretrain --data data/tokens/mini --out out/small/pretrain \
+    --preset small --seq-len 4096 --batch-size 8 --epochs 1                               # 中断后加 --resume 接着跑
+```
+
+**3. 后训练，然后聊两句**
+
+```bash
+python -m tools.prepare --chat --input data/sft_small.parquet --out data/tokens/sft-small --seq-len 2048
+python -m training.train_sft --init out/small/pretrain/ckpt.pt --data data/tokens/sft-small --out out/small/sft --epochs 2
+python -m training.train_rl --init out/small/sft/ckpt.pt --tasks data/rl_small.parquet --out out/small/rl \
+    --judge-url http://localhost:8000/v1                                                   # 评审模型的接口，见「RLAIF」
+python -m inference.chat out/small/rl/ckpt.pt --tools
+```
+
+**只想看看整条链能不能跑**：`python -m tools.demo` 在一个 25M 的小模型上把所有阶段跑一遍（Mac 上约 3.5 小时）。
+
+---
+
+## 代码结构
+
+```
+lm/                    模型的定义，只有模型（一个文件一个概念）
   config.py              所有尺寸和开关；small / medium / large 三档预设
   model.py               整个模型的组装和前向
-  generation.py          带缓存的逐词生成、采样
   layers/
     attention.py           分组查询注意力 + QK 归一化 + 旋转位置编码 + 滑动窗口
     feedforward.py         ReLU² 前馈层
@@ -20,32 +89,18 @@ lm/                    只放模型的定义（一个文件一个概念）
     streams.py             多条流的入口和出口（用注意力）
     block.py               一层 = 记忆注入 + 注意力 + 前馈
     norm.py / rotary.py    归一化、位置编码
-training/              训练，和模型定义分开；每个阶段一个脚本，从头读到尾就是这个阶段的全部，参数都在文件末尾的 parse_args 里
+training/              训练；每个阶段一个脚本，从头读到尾就是这个阶段的全部，参数都在文件末尾的 parse_args 里
   train_pretrain.py      预训练（也用于退火：--init 从存档出发，--data 按比例混合几份数据）
-  train_sft.py           SFT：从存档出发，只在回答上算损失，按轮数或步数训（通用 SFT 和领域专家都用它）
-  train_distill.py       MOPD：多老师在线蒸馏
+  train_sft.py           SFT：只在回答上算损失（通用 SFT 和领域专家都用它）
+  train_distill.py       MOPD：多老师在线蒸馏，按领域路由到老师
   train_rl.py            GRPO（Dr. GRPO）：RLVR、agent RL、RLAIF 共用
-  trainer_utils.py       几个脚本共用的：设备和混合精度、学习率曲线、优化器（各组学习率都能在命令行上改）、存档
+  trainer_utils.py       共用的：设备和混合精度、学习率曲线、优化器、存档
   dataset.py             训练数据的读写（预训练的长串、打包好的对话、按比例混合）
   muon.py                自己写的 Muon（另一条路径是 PyTorch 自带的，--optimizer native）
-  rollout.py             采样一组回答、带工具的多轮对话（RL、MOPD、评测共用）
-  rewards/               数学、代码（沙箱）、诗词格律、评审模型、工具环境
-inference/             推理
-  tokenizer.py           读正式分词器
-  template.py            对话格式和工具调用
-  generate.py            生成；CUDA 上自动走 fast.py
-  fast.py                预分配的静态缓存 + torch.compile（CUDA graph）
-  chat.py                命令行里和模型对话
-eval/                  评测：留出文档上各类别的损失、题目正确率、评审打分、固定提问的回答；C-Eval、CMMLU、GSM8K
-tools/                 辅助工具，都是命令行
-  report.py              参数量明细和各部件占比
-  bench.py               训练速度、生成速度（--generate）
-  tokenizer.py           按配比抽样本、训练 SentencePiece 分词器、量压缩率
-  prepare.py             把文本或对话变成训练用的数据
-  overfit.py             过拟合检查
-  demo.py                在 25M 的小模型上把整条链跑一遍
-  judge_check.py         用好回答和故意弄坏的回答检查评审模型和评分细则
-tokenizer/             正式分词器（tokenizer.model、tokenizer.vocab）
+  rollout.py             采样一组回答、带工具的多轮对话
+  rewards/               判分：数学、代码（沙箱）、选择题、阅读、填空、指令跟随、逻辑题、诗词格律、评审模型、工具环境
+inference/             推理：分词器、对话格式、生成（CUDA 上走静态缓存 + CUDA graph）、命令行对话、OpenAI 兼容服务
+eval/                  评测：留出集损失、题目正确率、评审打分、C-Eval / CMMLU / GSM8K
 dataset/               数据流水线（tinybrain dataset）
   sources.py             所有来源一张表：出自哪里、许可证、怎么下载、怎么取正文
   download.py            下载原始数据
@@ -55,60 +110,139 @@ dataset/               数据流水线（tinybrain dataset）
   sft.py                 SFT 语料
   rl.py                  RL 题目、评测题、MOPD 提示
   build.py               总入口：按顺序跑各步，开跑前检查输入
-docs/                  设计文档（post-training.md：后训练流程；rlaif-rubric.md：评审的评分细则）
+tools/                 辅助工具：参数量报告、测速、训练分词器、切词、过拟合检查、整条链演示、评审模型检查
+tokenizer/             正式分词器（tokenizer.model、tokenizer.vocab）
+docs/                  设计文档：post-training.md（后训练流程）、rlaif-rubric.md（评审的评分细则）
+data/                  数据（不进仓库）：raw 原始下载、clean 洗好的、inputs 后训练原料、*.parquet 成品
 ```
+
+---
 
 ## 模型
 
-| 部件 | 做法 |
-|---|---|
-| 残差 | 4 条流的 mHC：每个子层有读、写、混三组静态系数，混合矩阵是双随机的 |
-| 入口 / 出口 | 每条流用注意力从「词向量、二元记忆、三元记忆」里各取所需；出口用注意力把 4 条流合成一条 |
-| 记忆 | Engram：2、3 元词组各用 8 个哈希查表；入口用一次，第 2 层前再带门控注入一次 |
-| 注意力 | 分组查询、QK 归一化、RoPE；三层只看最近 1024 个词，第四层看全文，上下文 8192 |
-| 前馈 | ReLU²；large 档换成混合专家 |
-| 归一化 | 带可学系数的 RMSNorm，输出投影零初始化 |
-| 优化器 | 矩阵始终用 Muon（自己写的或 PyTorch 自带的，二选一），词向量、输出层、记忆表、各种系数用 Adam |
+### 总览
 
-三档预设（词表 32768）：
+```
+词编号 ─┬─ 词向量 ────────────────┐
+        └─ Engram 查表 ─┬─ 二元记忆 ┤  三份「来源」
+                        └─ 三元记忆 ┘
+                               │ 入口：每条流用注意力挑自己要的来源
+                               ▼
+                     n=4 条残差流 (B, T, 4, d)
+                               │
+        ┌──────── 第 i 层（重复 L 次）─────────┐
+        │  [第 1、中间层] Engram 门控注入        │
+        │  读(pre) → RMSNorm → 注意力 → 写(post)，流之间按 res 混合 │
+        │  读(pre) → RMSNorm → 前馈/MoE → 写(post)，流之间按 res 混合 │
+        └──────────────────────────────────────┘
+                               │ 出口：注意力把 4 条流合成一条
+                               ▼
+                     RMSNorm → 输出层（和词向量不共享）→ logits
+```
 
-| 档 | 主干 | 记忆表 | 词向量 + 输出层 | 合计 | 说明 |
+### 多流残差（mHC）
+
+普通残差只有一条流：$x \leftarrow x + F(x)$。tinybrain 把残差拓宽成 $n=4$ 条流 $X \in \mathbb{R}^{n \times d}$，每个子层（注意力、前馈各算一个）有三组可学的系数：
+
+$$
+X \leftarrow H^{\text{res}} X + h^{\text{post}} \otimes F\!\left(\textstyle\sum_{s} h^{\text{pre}}_s X_s\right)
+$$
+
+- **读** $h^{\text{pre}} = \sigma(\cdot) \in (0,1)^n$：把 4 条流加权合成这个子层的输入；
+- **写** $h^{\text{post}} = 2\sigma(\cdot) \in (0,2)^n$：子层的输出按多大比例加回每条流；
+- **混** $H^{\text{res}} \in \mathbb{R}^{n\times n}$：流和流之间互相搬运。它被约束成**双随机矩阵**（每行每列和为 1），所以信号总量在层与层之间不会被放大或缩小——这是 mHC 相对原始 Hyper-Connections 的改进，解决了深层训练不稳。
+
+双随机用 Sinkhorn 迭代得到：对 $\exp(\text{logits})$ 交替按列、按行归一，在对数域里做 20 次：
+
+$$
+\log M \leftarrow \log M - \operatorname{logsumexp}_{\text{行}}(\log M),\qquad \log M \leftarrow \log M - \operatorname{logsumexp}_{\text{列}}(\log M)
+$$
+
+这里用的是**静态**版：系数不看输入，整个模型所有子层的系数放在一起一次算完，几乎不花时间。初始化让它等价于普通残差（$H^{\text{res}} \approx I$，第 $s$ 个子层主要读第 $s \bmod n$ 条流）。代码：`lm/layers/hyper.py`。
+
+### Engram：查表记忆
+
+很多知识是「看到这几个字就该想起什么」，用矩阵乘去算有点浪费。Engram 直接按「前 $n-1$ 个词 + 当前词」查表：对阶数 $n \in \{2, 3\}$、每个哈希头 $h$（8 个），
+
+$$
+\text{row}_{n,h}(p) = \Big(\bigoplus_{j=0}^{n-1} t_{p-j}\cdot m_{n,h,j}\Big) \bmod P_{n,h} + \text{offset}_{n,h}
+$$
+
+$t_{p-j}$ 是往前第 $j$ 个词的编号，$m$ 是固定的随机奇数乘数，$\oplus$ 是按位异或，$P_{n,h}$ 是互不相同的质数（不同哈希头的碰撞不会成对出现）。每个位置取回 $2 \times 8$ 行、每行宽 32（small）的向量，拼起来、归一化。
+
+取回的记忆用两次：
+
+1. **入口**：每个阶数投影成一份 $d$ 维的「来源」，和词向量一起交给流入口；
+2. **门控注入**：在第 1 层（medium、large 再加中间一层）之前，每条流拿自己当前的状态和记忆的「键」比一比，决定收多少：
+
+$$
+g_s = \sigma\!\left(\frac{\langle \text{RMSNorm}(X_s),\ \text{RMSNorm}(K_s\,e)\rangle}{\sqrt{d}}\right),\qquad X_s \leftarrow X_s + g_s \cdot V e
+$$
+
+记忆表查一次只取十几行，**不花算力，只占显存**。所以三档的记忆表都做得很大：统一占「主干 + 记忆表」参数的 45%（`ENGRAM_SHARE`）。代码：`lm/layers/engram.py`。
+
+### 流的入口和出口
+
+- **入口**：一个位置有三份来源（词向量、二元记忆、三元记忆）。每条流 $m$ 有一个自己的查询向量 $q_m$，对来源打分、加权求和：$X_m = \sum_s \operatorname{softmax}_s\!\big(q_m^\top k_s / \sqrt{d_k}\big)\, \text{src}_s$。不同的流可以偏好不同的来源。
+- **出口**：一个可学的查询向量对 4 条流打分、加权合成一份。查询从零开始，所以一开始就是 4 条流的平均。
+
+代码：`lm/layers/streams.py`。
+
+### 注意力
+
+- **分组查询注意力（GQA）**：small 有 12 个查询头、3 组键值头，键值缓存小到四分之一；
+- **QK 归一化**：查询和键先过 RMSNorm 再做点积，训练更稳；
+- **旋转位置编码（RoPE）**，底数 10000，上下文 8192；
+- **滑动窗口 3:1**：每 4 层里前 3 层只看最近 1024 个词，第 4 层（以及最后一层）看全文。窗口层按块算——把序列切成 1024 长的块，每块的查询只和「上一块 + 本块」的键算，计算量从 $T^2$ 降到 $2WT$，结果和逐位置加掩码完全一样。
+
+代码：`lm/layers/attention.py`。
+
+### 前馈和混合专家
+
+普通前馈层用 ReLU²：$\text{FFN}(x) = W_2\,\text{ReLU}(W_1 x)^2$，中间宽度 4d。
+
+large 档换成混合专家：一个整宽的**共享专家**，加上从 24 个四分之一宽的专家里选 8 个：
+
+$$
+s = \sqrt{\operatorname{softplus}(W_r z)},\qquad \mathcal{K} = \operatorname{top\text{-}k}(s + b),\qquad y = \text{FFN}_{\text{shared}}(x) + \sum_{e \in \mathcal{K}} \frac{s_e}{\sum_{e' \in \mathcal{K}} s_{e'}}\,\text{FFN}_e(z)
+$$
+
+负载均衡有两层：
+- **偏置均衡**（不参与求导）：每个专家有一个偏置 $b_e$，只在「挑谁」时加上。每步按实际负载调整：$b_e \leftarrow b_e + \gamma \cdot \operatorname{sign}(1/E - \text{load}_e)$，$\gamma = 10^{-3}$。活儿多的专家偏置降一点，下次就少被挑。
+- **很轻的均衡损失**：$\mathcal{L}_{\text{bal}} = E \sum_e \text{load}_e \cdot \text{share}_e$，权重 $10^{-4}$。$\text{load}_e$ 是专家实际接了多大比例的词，$\text{share}_e$ 是它平均拿到多大比例的分数。
+
+可选 LatentMoE：先把输入压到更窄的宽度，路由和专家都在压缩后的空间里算，最后再升回来。代码：`lm/layers/moe.py`。
+
+### 其他细节
+
+- **RMSNorm 带可学系数**（PyTorch 的 `nn.RMSNorm`，CUDA 上是融合内核）；
+- **词向量和输出层不共享**；
+- **初始化**：每个子层往残差流里写的那个投影（注意力输出、前馈的第二个矩阵、记忆注入的值）都从零开始，所以刚初始化时每一层什么都不加；其余矩阵按输入宽度均匀分布。
+
+### 三档预设（词表 32768）
+
+| 档 | 宽 × 层 | 主干 | 记忆表 | 词向量 + 输出层 | 合计 |
 |---|---|---|---|---|---|
-| small | 64M | 53M（每个哈希 10 万行 × 宽 32） | 50M | 167M | 768 宽 × 10 层 |
-| medium | 233M | 190M（25 万行 × 宽 48） | 75M | 499M | 1152 宽 × 16 层 |
-| large | 556M，每个词用到 294M | 455M（44 万行 × 宽 64） | 84M | 1.09B | 1280 宽 × 20 层，前馈层是 24 选 8 的四分之一宽专家加一个共享专家 |
+| small | 768 × 10 | 64M | 53M（每个哈希约 10 万行 × 宽 32） | 50M | 167M |
+| medium | 1152 × 16 | 233M | 190M（约 25 万行 × 宽 48） | 75M | 499M |
+| large | 1280 × 20 | 556M（每个词用到 294M） | 455M（约 44 万行 × 宽 64） | 84M | 1.09B |
 
-三档的记忆表各不相同，大小统一按一个比例定：记忆表占「主干 + 记忆表」的 45%（`lm/config.py` 里的 `ENGRAM_SHARE`，词向量和输出层不算在内）。
-记忆表查一次只取十几行，不花算力，只占显存。
+large 的前馈层是 24 选 8 的四分之一宽专家加一个整宽的共享专家。`python -m tools.report small` 打印每个部件的参数量。
 
-## 用法
-
-```bash
-pip install -e ".[data]"
-python -m tools.report small                       # 参数量明细
-python -m tools.bench small --batch 8 --seq 8192   # 当前机器上的训练速度和显存
-python -m tools.bench small --optimizer native     # 换成 PyTorch 自带的 Muon 比一比
-```
-
-```python
-import torch
-from inference import generate
-from lm import LanguageModel, preset
-from training.trainer_utils import build_optimizers
-
-model = LanguageModel(preset("small", vocab_size=32768))
-optimizers = build_optimizers(model, "custom")  # 或 "native"；各组学习率是关键字参数，比如 matrix_lr=0.02
-idx = torch.randint(0, 32768, (2, 512))
-loss = model(idx[:, :-1], idx[:, 1:]).loss
-text = generate(model, idx[:, :8], max_new_tokens=32, top_k=50)
-```
+---
 
 ## 分词器
 
-`tokenizer/tokenizer.model`：SentencePiece BPE，32768 词，在按配比抽出的约 3500 万 token 样本上训练（每个来源读 3 个分片，现洗）。
-不做归一化、字节兜底、数字逐位拆开、字符覆盖率 0.99995，解码和原文一字不差；0–3 是未知、开头、结束、填充，另留 8 个控制符给对话格式。
+`tokenizer/tokenizer.model`：SentencePiece BPE，**32768 词**，在按配比抽出的约 3500 万 token 样本上训练。
 
-在留出文档上，一个词平均几个字：中文文章 1.70、百科 2.16、古文 1.11、代码 2.84、数学 3.09、论文 3.40、英文网页 4.16，合计 2.38。
+- 不做任何归一化，字节兜底，数字逐位拆开，字符覆盖率 0.99995，**解码和原文一字不差**；
+- 0–3 是未知、开头、结束、填充，另留 8 个控制符：`<|im_start|>`、`<|im_end|>` 给对话格式，两个给工具调用，其余备用。
+
+在留出文档上一个词平均几个字（越大越省）：
+
+| 中文文章 | 百科 | 古文 | 代码 | 数学 | 论文 | 英文网页 | 合计 |
+|---|---|---|---|---|---|---|---|
+| 1.70 | 2.16 | 1.11 | 2.84 | 3.09 | 3.40 | 4.16 | 2.38 |
 
 ```bash
 python -m tools.tokenizer sample --tokens 40000000      # 重新抽样本
@@ -116,70 +250,303 @@ python -m tools.tokenizer train --vocab 32768           # 重新训练
 python -m tools.tokenizer eval tokenizer/tokenizer.model
 ```
 
-## 预训练
+---
 
-```bash
-# 1. 把文本变成词数据
-python -m tools.prepare --input "data/mix/out/nano/*.parquet" --out data/tokens/nano
-# 2. 训练；中断后加 --resume 接着跑
-python -m training.train_pretrain --data data/tokens/nano --out out/small-nano --preset small --seq-len 4096 --batch-size 8 --epochs 1
-python -m training.train_pretrain --help     # 全部参数：模型（--dim、--n-layers……）、各组学习率（--matrix-lr、--embed-lr……）、记录和存档
-```
+## 数据集：tinybrain dataset
 
-输出目录里是 `config.json`（全部设置）、`log.jsonl`（损失、速度、验证集损失）、`ckpt.pt`（最新存档）。
-按轮数训（`--epochs`，可以是小数；也可以直接给 `--steps`）：数据切成不重叠的片段，每轮打乱一次依次取完，一轮里每个片段恰好看一遍。
-日志每一行都写着已经训了多少词（`tokens`）和多少轮（`epoch`），开训时也会先打印「共 N 步 = 多少词 = 几轮」。
-目前是单卡、最简单的版本：预热加余弦的学习率、梯度累积、定期验证和存档；中断后 `--resume` 接着跑，结果和一口气跑完一样。
+一份以中文为主的混合预训练集，分四档，大档包含小档（nano ⊂ mini ⊂ base ⊂ full）。token 数是用上面的分词器实测的。
 
-## 后训练
+| 档 | 真实 token | 篇数 | 文件大小 | 适合 |
+|---|---|---|---|---|
+| nano | 0.99B | 54 万 | 2.1 GB | 跑通流程、做小实验 |
+| mini | 4.96B | 348 万 | 10.3 GB | small（167M） |
+| base | 20.19B | 1319 万 | 40.6 GB | medium（499M） |
+| full | 60.26B | 4298 万 | 117 GB | large（1.09B） |
 
-完整设计见 [docs/post-training.md](docs/post-training.md)。
+每个文件都是完整的一档、内部打乱：要 mini 就只读 `pretrain_mini.parquet`。列：`text`、`source`、`category`、`license`、`quality`、`est_tokens`。
 
-```
-small        ：预训练(mini 5B) → 退火 → SFT（small 专用的大语料）→ agent RL（基础工具调用）→ RLAIF
-medium/large ：预训练(base 20B / full ~70B) → 退火 → SFT（各自的语料）
-                 → 领域专家（代码、数学：SFT + RLVR；高质量文学：SFT）→ MOPD → agent RL → RLAIF
-```
+### 配比
 
-- **每档都能单独跑通**，不依赖别的尺寸。
-- **退火**：预训练最后 10% 的步数，数据里一成是对话格式，所有 token 算损失。
-- **MOPD**：学生自己生成，对应领域的专家逐 token 打分，最小化全词表上的反向 KL。
-- **RL**：一个 GRPO 训练器（Dr. GRPO 修正），奖励来自判分器（RLVR）、工具环境（agent RL）、评审模型 Qwen3.8-27B（RLAIF，评分细则见 `docs/rlaif-rubric.md`）。
-- **鲁迅全集**做成续写题，原文当参考给评审，专门补通用语言能力。
+nano、mini、base 严格按下面的配比挑（按真实 token 算）；full 是去重后的全部，各类别有多少放多少。
 
-```bash
-python -m dataset.build sft rl                                                 # 后训练数据（SFT 语料、RL 题目、评测题、MOPD 提示）
-python -m tools.prepare --chat --input data/sft_small.parquet --out data/tokens/sft-small --seq-len 2048
-python -m training.train_sft --init out/small/anneal/ckpt.pt --data data/tokens/sft-small --out out/small/sft --epochs 2
-python -m training.train_rl --init out/small/sft/ckpt.pt --tasks data/rl_small.parquet --out out/small/rl --judge-url http://localhost:8000/v1
-python -m training.train_distill --init out/medium/sft/ckpt.pt --prompts data/mopd_prompts.parquet --out out/medium/mopd \
-    --teachers 代码=out/medium/expert_code/ckpt.pt 数学=out/medium/expert_math/ckpt.pt 文学=out/medium/expert_literature/ckpt.pt 通用=out/medium/sft/ckpt.pt
-python -m eval.benchmarks prepare                                              # 下载标准基准（只在本地评测用）
-python -m eval.suite out/small/rl/ckpt.pt --tasks data/eval_tasks.parquet --bench ceval cmmlu gsm8k
-python -m eval.benchmarks run out/small/pretrain/ckpt.pt --shots 5           # 基座模型：不套对话格式，带例题
-python -m inference.chat out/small/rl/ckpt.pt --tools
-python -m tools.demo --judge-url http://127.0.0.1:8080/v1     # 小模型上整条链跑一遍
-```
+| 类别 | 配比 | 主要来源 |
+|---|---|---|
+| 中文文章 | 37% | Fineweb-Edu-Chinese-V2.2（教育质量 3–5 分） |
+| 百科 | 15.5% | 中文维基、英文维基、百度百科 |
+| 代码 | 12% | UltraData-Code、UltraData-Stack-v3 |
+| 数学 | 10% | Nemotron 数学教材、IFM 数学改写、FineMath、UltraData-Math、NuminaMath |
+| 论文 | 8% | arXiv、peS2o |
+| 古文和公版书 | 6% | 维基文库、殆知阁古籍、greathangpt、shu、古腾堡中文书、诗词、鲁迅全集 |
+| 英文网页 | 5% | Ultra-FineWeb |
+| 英文书 | 4% | 古腾堡（排除 PG-19 的验证集和测试集） |
+| 合成 | 2.25% | Chinese Cosmopedia |
+| 法律 | 0.25% | 中国法律法规 |
 
-## 数据集
+26 个来源各自的出处、许可证、下载方式和取正文的方式都登记在 `dataset/sources.py`；生成的数据集说明（`python -m dataset.mix card`）列出每个来源在每档里的用量。
 
-一份以中文为主的混合预训练集，分四档，大档包含小档（token 数按正式分词器算）：
+### 怎么做的
 
-| 档 | 大小 | 怎么挑 | 适合 |
-|---|---|---|---|
-| nano | 1B | 按配比，每个来源取质量最高的 | 跑通流程、做小实验 |
-| mini | 5B | 同上 | small（167M） |
-| base | 20B | 同上 | medium（499M） |
-| full | 去重后的全部，60.26B | 不挑，比例跟着池子走 | large（1.09B） |
+1. **清洗**（`dataset/clean.py`、`dataset/pretrain.py`）：修乱码，统一标点和空白，繁体转简体；去掉太短、不成句、语言不对、广告、重复太多、有屏蔽字的文档；手机号、身份证号、邮箱换成占位符；书和古籍按章节切成篇；维基去掉表格、模板残留和「参考文献」之后的部分。每篇算一个质量分（来源自带的分数，或者按语言、重复、成句、广告、长度、用字丰富度算的启发式分数）。法院裁判文书因为含有当事人的姓名、出生日期和住址，没有放进来。
+2. **跨来源去重**（`dataset/mix.py index`）：每篇取最长的 3 句当指纹；一篇文档如果有 2 句（指纹不足两个的，全部指纹）在优先级更高的文档里出现过，就算重复。只撞一句不算——一条常见的法律条文会出现在很多不同的文章里。优先级是整理过的来源（法律、诗词、古籍、维基……）在前，网页抓取的在后。去重去掉了约四分之一。
+3. **分档**（`mix.py plan`、`write`）：按配比算出每个来源每档取多少；来源内部按质量分从高到低取，最好的进 nano，往下依次进 mini、base。所以**越小的档单篇质量越高**，大档的价值在量。
+4. **检查**（`mix.py verify`）：每个来源的 token 数和计划一致；文件内部没有重复（允许十万分之一以内：句子太短、取不出指纹的残篇会漏下，base 和 full 里有 41 篇）；小档完整包含在大档里；顺序是打乱的。
 
-做出来是 `data/pretrain_nano.parquet`、`_mini`、`_base`、`_full` 四个文件（2.1 / 10.3 / 40.6 / 117 GB），每个都是完整的一档、内部打乱。
-token 数是正式分词器的真实 token（抽样实测）。每个来源的出处、许可证和各档用量见生成的数据集说明（`python -m dataset.mix card`）。
+### 许可
+
+混合数据集没有统一的许可证：每篇文档带着 `license` 列，写的是它所属来源的许可证。维基百科、维基文库是 CC BY-SA 3.0（署名、相同方式共享）；百度百科和 shu 的上游没写清楚许可证，标成「待确认」，商用前请自行确认，或者按 `source` 列去掉。
 
 ```bash
 python -m dataset.build --check              # 每一步要什么、有没有、会产出什么
-python -m dataset.build                      # 从头做：download → clean → mix → sft → rl
-python -m dataset.download wiki_zh --list    # 只看某个来源会下哪些文件
-python -m dataset.pretrain audit <来源>       # 抽查洗出来的结果
+python -m dataset.download wiki_zh --list    # 某个来源会下哪些文件
+python -m dataset.pretrain audit wiki_zh     # 抽查洗出来的结果：随机看几篇、最常重复的行、可疑痕迹
 ```
 
-来源、各自的许可、下载方式和取正文的方式都登记在 `dataset/sources.py` 里；配比在 `dataset/mix.py` 的 `MIX` 里。
+---
+
+## 预训练
+
+```bash
+python -m tools.prepare --input data/pretrain_mini.parquet --out data/tokens/mini
+python -m training.train_pretrain --data data/tokens/mini --out out/small/pretrain --preset small --seq-len 4096 --batch-size 8 --epochs 1
+python -m training.train_pretrain --help     # 全部参数：模型（--dim、--n-layers……）、各组学习率、记录和存档
+```
+
+### 损失
+
+下一个词预测，所有位置都算交叉熵；有 MoE 时加上均衡损失：
+
+$$
+\mathcal{L} = -\frac{1}{T}\sum_{t=1}^{T} \log p_\theta(x_{t} \mid x_{<t}) + 10^{-4}\,\mathcal{L}_{\text{bal}}
+$$
+
+### 按轮数训
+
+`--epochs`（可以是小数；也可以直接给 `--steps`）：数据切成不重叠的片段，每轮打乱一次依次取完，**一轮里每个片段恰好看一遍**。日志每一行都写着已经训了多少词、多少轮，开训时先打印「共 N 步 = 多少词 = 几轮」。第几批取哪些片段只由种子和批次序号决定，所以中断后 `--resume` 接着跑，和一口气跑完结果一样。
+
+### 优化器：矩阵用 Muon，其余用 Adam
+
+**Muon**（`training/muon.py`）管所有矩阵（注意力、前馈、专家、各种投影）。思路是：先做动量，再把更新量「正交化」——让它的奇异值都接近 1，这样每个方向走的步子一样大，不会被少数几个大方向主导：
+
+$$
+B \leftarrow \mu B + (1-\mu) G,\qquad U = (1-\mu) G + \mu B\ \ (\text{Nesterov}),\qquad O = \operatorname{NS}_5(U)
+$$
+
+$$
+W \leftarrow (1 - \eta\lambda)\,W - \eta \sqrt{\max(1,\ m/n)}\; O
+$$
+
+$\operatorname{NS}_5$ 是 5 次 Newton–Schulz 迭代，不用做 SVD：
+
+$$
+X_0 = U / \lVert U \rVert,\qquad A = X X^\top,\qquad X \leftarrow aX + (bA + cA^2)\,X,\qquad (a, b, c) = (3.4445,\ -4.7750,\ 2.0315)
+$$
+
+形状相同的矩阵叠在一起一次算完；CUDA 上用 bf16 算正交化。`--optimizer native` 换成 PyTorch 自带的 `torch.optim.Muon`（两条路径的更新结果几乎一样，有测试对照）。
+
+**Adam** 管词向量、输出层、记忆表和零碎的系数（$\beta = (0.8, 0.95)$），学习率按 $(d/768)^{-1/2}$ 缩放：
+
+| 参数组 | 起步学习率 | 命令行 |
+|---|---|---|
+| 矩阵（Muon） | 0.02 | `--matrix-lr` |
+| 词向量 | 0.3 | `--embed-lr` |
+| 输出层 | 0.004 | `--head-lr` |
+| 记忆表（不做权重衰减） | 0.3 | `--engram-lr` |
+| 归一化系数、多流残差系数、流入口出口的查询 | 0.01 | `--scalar-lr` |
+
+这些都是起步值，还没在我们的数据上调过。
+
+### 学习率曲线
+
+先线性预热，再按余弦降到起步值的 $f$ 倍（`--final-lr-frac`，预训练默认 0.1）：
+
+$$
+\text{scale}(t) = \begin{cases} \dfrac{t+1}{T_w} & t < T_w \\[2mm] f + (1-f)\cdot\dfrac{1 + \cos(\pi p)}{2},\quad p = \dfrac{t - T_w}{T - T_w} & t \ge T_w \end{cases}
+$$
+
+每组的学习率 = 起步值 × scale(t) × `--lr-mult`。
+
+---
+
+## 后训练
+
+```
+small        ：预训练(mini) → 退火 → SFT → agent RL（同时练指令跟随、中文阅读、诗词填空）→ RLAIF
+medium/large ：预训练(base / full) → 退火 → SFT → 领域专家（数学、代码：SFT + RLVR；文学：SFT）
+               → MOPD → RL（工具调用、科学选择题、指令跟随、阅读、填空）→ RLAIF
+```
+
+每档都能单独跑通，不依赖别的尺寸。完整的设计和取舍见 [docs/post-training.md](docs/post-training.md)。
+
+```bash
+python -m dataset.build sft rl       # 后训练数据：SFT 语料、RL 题目、评测题、MOPD 提示
+```
+
+### 退火
+
+预训练最后一段（默认最后 10% 的步数）换数据接着训：九成预训练数据 + 一成对话格式的数据（整段都算损失），学习率从 0.1 倍降到 0。用的还是 `train_pretrain.py`：
+
+```bash
+python -m training.train_pretrain --init out/small/pretrain/ckpt.pt --data data/tokens/mini:0.9,data/tokens/chat-all:0.1 \
+    --out out/small/anneal --epochs 0.1 --warmup-steps 0 --lr-mult 0.1 --final-lr-frac 0
+```
+
+### SFT
+
+对话格式（`<|im_start|>`、`<|im_end|>` 是分词器里预留的控制符，正文里写出同样的字符串也不会变成控制符）：
+
+```
+<|im_start|>system
+你是 tinybrain……<|im_end|>
+<|im_start|>user
+床前明月光的下一句是什么？<|im_end|>
+<|im_start|>assistant
+疑是地上霜。<|im_end|>
+```
+
+**只在回答上算损失**：每个位置带一个遮罩 $m_t \in \{0,1\}$，只有助手的回答和它后面的 `<|im_end|>` 是 1：
+
+$$
+\mathcal{L}_{\text{SFT}} = -\frac{\sum_t m_t \log p_\theta(x_t \mid x_{<t})}{\sum_t m_t}
+$$
+
+对话按长度打包成等长的行（一段对话不拆到两行，行尾用填充补齐），按轮数训（`--epochs`），学习率默认是预训练的 0.1 倍。
+
+**SFT 语料**（`dataset/sft.py`）：18 个外部来源（smoltalk-chinese、COIG-CQIA、Chinese-Instruct、deepctrl、Infinity-Instruct、NuminaMath-CoT、OpenCoder SFT、ToolACE……，每个取前 10 万条），加上自己做的文学数据（按题写诗、文白互译、鲁迅续写）和自我认知。三档的区别：small 去掉推理过程、截到 2048 词，并且每个外部来源按回答的质量分只留好的一半；medium、large 保留 `<think>` 推理过程，截到 4096 / 8192 词，多几个推理和 agent 来源。每个来源留出 2% 的问题不进 SFT，给 RL 和评测出题。
+
+**领域专家**（medium、large）：从通用 SFT 模型复制出三份，分别在数学、代码、文学数据上接着 SFT，数学和代码专家再做 RLVR。
+
+### MOPD：多老师在线蒸馏
+
+把几个专家的本事合回一个通用模型。做法是让**学生自己生成回答**，再让对应领域的专家逐位置给出它的概率分布，最小化学生对老师的**反向 KL**：
+
+$$
+\mathcal{L}_{\text{MOPD}} = \frac{1}{\sum_i |y_i|}\sum_i \sum_{t \in y_i} \sum_{v \in V} \pi_\theta(v \mid h_{i,t}) \Big[\log \pi_\theta(v \mid h_{i,t}) - \log \pi_{T(d_i)}(v \mid h_{i,t})\Big]
+$$
+
+- $y_i \sim \pi_\theta$ 是学生自己写的回答，$h_{i,t}$ 是提示加上回答的前 $t$ 个词；
+- $T(d_i)$ 是第 $i$ 道题的老师，按领域 $d_i$ 路由：数学、代码、文学各有专家；逻辑题交给数学专家，阅读、诗词、写作交给文学专家，指令跟随、科学、工具调用和通用题交给 SFT 模型自己（`training/train_distill.py` 的 `ROUTES`，`--route 领域=老师` 可以改）；
+- 学生和老师用同一个分词器，所以 KL 在**整个词表上精确地算**，不是只靠采样出的那一个词去估。
+
+**为什么是在线、为什么是反向 KL**：普通蒸馏让学生模仿老师写好的文本，学生训练时只见过「老师的前文」，自己生成时一旦写偏就没见过这种情况（暴露偏差）。在线蒸馏在学生自己的回答上纠错，正好覆盖它会犯的错。反向 KL $\text{KL}(\pi_\theta \Vert \pi_T)$ 是「寻峰」的：学生只需要把概率放在老师认可的地方，不用强行覆盖老师的所有可能——对容量小的学生更合适。
+
+`--merge-init`：开始前先做任务算术，把学生换成 $\theta \leftarrow \theta + \frac{1}{K}\sum_k (\theta_k - \theta)$（各专家相对 SFT 模型的改动取平均）。
+
+### RL：从 PPO 到 GRPO，再到我们的写法
+
+**PPO** 的策略损失（每个位置 $t$）：
+
+$$
+\mathcal{L}^{\text{PPO}} = -\mathbb{E}_t\Big[\min\big(\rho_t A_t,\ \operatorname{clip}(\rho_t,\,1-\epsilon,\,1+\epsilon)\,A_t\big)\Big],\qquad \rho_t = \frac{\pi_\theta(y_t \mid h_t)}{\pi_{\theta_{\text{old}}}(y_t \mid h_t)}
+$$
+
+- $\rho_t$ 是新旧策略的概率比：同一批回答要用来更新好几次，更新后的策略和采样时的不一样了，所以要按比例修正；
+- $\operatorname{clip}$ 不让一次更新走太远；
+- 优势 $A_t$ 要一个**价值模型**（critic）来估，和策略一样大，训练和显存都翻倍。
+
+**GRPO**（DeepSeekMath）去掉了价值模型：每道题采一组 $G$ 个回答，用**组内比较**当优势：
+
+$$
+A_i = \frac{r_i - \operatorname{mean}(r_1, \dots, r_G)}{\operatorname{std}(r_1, \dots, r_G)}
+$$
+
+并且每个回答的损失按它的长度 $|y_i|$ 平均。
+
+**Dr. GRPO** 指出这两处会带偏：除以标准差，会让「几乎全对或全错」的简单题、难题权重过大；按长度平均，会让答错的长回答每个词受的惩罚变小，模型于是越答越长。改法是**不除标准差、用一个常数代替长度**。
+
+**tinybrain 的写法**（`training/train_rl.py`）：在 Dr. GRPO 的基础上，每批回答**只更新一次**（完全在线）。这时 $\theta = \theta_{\text{old}}$，$\rho_t = 1$，clip 不起作用，min 里两项一样，PPO 的梯度正好退化成带组内基线的策略梯度。所以损失直接写成：
+
+$$
+\mathcal{L}_{\text{RL}} = -\frac{1}{N \cdot L_{\max}} \sum_{i=1}^{N} A_i \sum_{t \in y_i} \log \pi_\theta(y_{i,t} \mid h_{i,t}),\qquad A_i = r_i - \frac{1}{G}\sum_{j \in \text{组}(i)} r_j
+$$
+
+$N$ 是这一步的回答总数（每步题数 × 每题回答数），$L_{\max}$ 是回答长度上限（`--max-new`），两个都是常数。整组奖励一样的题优势全是 0，不贡献梯度。agent 题里工具返回的内容不是模型写的，遮掉不算。没有价值模型，也没有参考模型的 KL 惩罚。
+
+RLVR、agent RL、RLAIF 用的是同一个训练器，区别只在题目和奖励：
+
+| 题型 | 奖励 $r$ | 题目来源 | 用在 |
+|---|---|---|---|
+| math | 最终答案（`\boxed{}` 或「答案是」）和标准答案相等（按数值比）→ 1，否则 0 | Big-Math-RL-Verified（挑 8B 模型解题率 0.2–0.95 的）、DeepScaleR、GSM8K_zh | medium、large |
+| code | 在沙箱里跑测试用例，全过 → 1 | DeepCoder-Preview 训练集；评测用其中的 Codeforces | medium、large |
+| logic | reasoning-gym 的判分函数（有的题允许多个对的答案） | reasoning-gym 现场生成：算术、数列、24 点、Countdown、骑士与无赖、小数独等 33 种 | medium、large |
+| choice | 选项字母对 → 1 | ARC、OpenScience | medium、large |
+| instruct | 满足的约束占比（字数、段落、编号、关键词、开头结尾、JSON、不用逗号……，程序检查） | RLVR-IFeval；给留出的中文问题加中文约束 | 三档 |
+| reading | 和参考答案按字算 F1，取最好的参考 | CMRC2018 | 三档 |
+| cloze | 去掉标点后和标准答案完全一样 → 1（回答不能长到把整首诗都写上） | 从诗词里出：给作者、题目、上句，写下句 | 三档 |
+| agent | 答案对 → 1；工具调用格式坏一次 −0.1 | 程序生成：大数运算、百分比、取模、日期、在维基资料里检索 | 三档 |
+| judge | 评审打分 $s \in [1,10]$，$r = (s - 5.5)/4.5 \in [-1, 1]$ | 留出的通用问题；鲁迅续写（附原文参考） | 三档 |
+| poetry | $r = 2\big(0.4\,r_{\text{格律}} + 0.6\,\tfrac{s-1}{9}\big) - 1$；字数句数不对时评审分减半 | 真实诗题，五绝、七绝、五律、七律 | 三档 |
+
+**格律分**（`training/rewards/poetry.py`）：句数、每句字数要对，否则 0；对了以后 $r_{\text{格律}} = 0.3 + 0.35\,r_{\text{押韵}} + 0.35\,r_{\text{平仄}}$。押韵看偶数句末字是否同韵且平声；平仄按「一三五不论，二四六分明」，在仄起、平起两种格式里取对得更好的。平仄和韵部用 pypinyin 按普通话近似，入声字会判错（这是已知的简化）。
+
+**RLAIF 的评审模型**：Qwen3.8-27B（Apache-2.0），按中文评分细则（`docs/rlaif-rubric.md`：通用、写作、古文、诗词四个领域）打 1–10 分，不开思考模式。显卡上用 vLLM 跑 FP8 版，Mac 上用 `mlx_lm.server` 跑 4-bit 版（一次只算一个请求，要加 `--judge-workers 1`）。`python -m tools.judge_check` 用好回答和故意弄坏的回答（截断、答非所问、车轱辘话、诗的字序打乱）检查评审分不分得清好坏。
+
+题目和评测题由 `dataset/rl.py` 生成：每种题先留出一份当评测题，和 RL 题、SFT 都不重复。
+
+---
+
+## 评测
+
+```bash
+python -m eval.benchmarks prepare                                             # 下载 C-Eval、CMMLU、GSM8K（只在本地评测用）
+python -m eval.suite out/small/rl/ckpt.pt --tasks data/eval_tasks.parquet --bench ceval cmmlu gsm8k --judge-url …
+python -m eval.benchmarks run out/small/pretrain/ckpt.pt --shots 5            # 基座模型：不套对话格式，带例题
+```
+
+- **留出集损失**：按类别（中文、百科、代码、数学、古文……）看后训练有没有把预训练学到的东西训坏；
+- **题目正确率**：每种 RL 题型留出的评测题，贪心作答，用同一套判分；
+- **标准基准**：C-Eval（验证集）、CMMLU 比较「答案：」后面四个选项字母的概率（不用生成，基座模型也能测）；GSM8K 贪心生成后对答案；
+- **固定提问**：每个阶段对同一组问题作答，放在一起给人看。
+
+C-Eval 是 CC BY-NC-SA 4.0、CMMLU 是 CC BY-NC 4.0，只下载到本地评测，不随仓库或数据集发布。
+
+---
+
+## 推理
+
+```bash
+python -m inference.chat out/small/rl/ckpt.pt --tools     # 命令行对话，--tools 打开计算器和 Python
+python -m inference.serve out/small/rl/ckpt.pt --port 8001  # OpenAI 兼容的 /v1/chat/completions，支持工具调用
+```
+
+CUDA 上生成走静态缓存：键值缓存按最大长度预先分配，每一步原地写入，形状完全固定，整步用 `torch.compile(mode="reduce-overhead")` 录成 CUDA graph（gpt-fast 的做法）。CPU、MPS 上走普通的带缓存生成，两条路径结果一样（有测试对照）。
+
+---
+
+## 演示结果
+
+25M 参数的演示模型（宽 256 × 4 层），用 nano 开头的 9000 万词预训练 1 轮，再把每个后训练阶段都跑一遍（下表这一次的后训练用的是每个来源约 1000 条的小样数据；用完整后训练数据的那一次跑完后替换）。**这一步只为确认整条链衔接无误，分数不代表能力**：这个尺寸只会复读，选择题在随机水平附近（四选一随机是 25%，每个基准只评了 100 题）。
+
+| 阶段 | 留出集损失 | C-Eval | CMMLU | GSM8K |
+|---|---|---|---|---|
+| 预训练 | 4.073 | 31% | 34% | 0% |
+| 退火 | 4.068 | 27% | 33% | 0% |
+| SFT | 4.279 | 32% | 36% | 1% |
+| 数学专家 | 4.651 | 25% | 33% | 1% |
+| 代码专家 | 4.911 | 28% | 36% | 3% |
+| MOPD | 4.289 | 31% | 36% | 0% |
+
+能看出来的只是机制在起作用：退火后损失再降一点；两个专家在通用留出集上损失明显升高（往自己的领域偏了）；MOPD 把学生拉回 SFT 的水平，同时吸收了专家。
+
+---
+
+## 还没做的
+
+- 在显卡上正式训练 small、medium、large，测训练时间和能力；
+- 评分细则和人工打分对比校准；
+- 古文、诗词的专门评测；MMLU、MATH-500、HumanEval、MBPP、IFEval 这些基准；
+- large 接小米开源的 MiMo agent 环境（通过 `inference/serve.py` 的 OpenAI 兼容接口）；
+- 诗词格律换成平水韵的字表。
+
+---
+
+## 参考
+
+- MiniMind — https://github.com/jingyaogong/minimind ；nanochat — https://github.com/karpathy/nanochat
+- Hyper-Connections（字节跳动）、mHC：Manifold-Constrained Hyper-Connections（DeepSeek）
+- Engram：按 n 元词组查表的条件记忆（DeepSeek）
+- Muon — https://kellerjordan.github.io/posts/muon/
+- GRPO：DeepSeekMath — https://arxiv.org/abs/2402.03300
+- Dr. GRPO：Understanding R1-Zero-Like Training — https://arxiv.org/abs/2503.20783
+- MOPD: Multi-Teacher On-Policy Distillation — https://arxiv.org/abs/2606.30406 ；CA-MOPD — https://arxiv.org/abs/2610.26950
+- reasoning-gym — https://github.com/open-thought/reasoning-gym
+- 数据集的每个来源见 `dataset/sources.py`
