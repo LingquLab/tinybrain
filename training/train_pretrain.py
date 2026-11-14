@@ -1,10 +1,10 @@
 """预训练，也用来退火。
 
-    python -m training.train_pretrain                                   # 默认：small，data/pretrain_nano.parquet，写到 out/small/pretrain
-    python -m training.train_pretrain --data data/pretrain_mini.parquet --seq-len 2048 --batch-size 16
+    tinybrain pretrain                                   # 默认：small，data/pretrain_nano.parquet，写到 out/small/pretrain
+    tinybrain pretrain --data data/pretrain_mini.parquet --seq-len 2048 --batch-size 16
 
     # 退火：从预训练的存档出发，九成预训练数据 + 一成对话数据（整段算损失），学习率从 0.1 倍降到 0；给了 --init 默认写到 out/small/anneal
-    python -m training.train_pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_nano.parquet:0.9,data/tokens/chat-all:0.1 \\
+    tinybrain pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_nano.parquet:0.9,data/tokens/chat-all:0.1 \\
         --steps 2000 --warmup-steps 0 --lr-mult 0.1 --final-lr-frac 0
 
 --data 可以直接给 parquet，第一次用时自动切词，放在它旁边的 tokens/ 目录里（见 tools.prepare.ensure_tokens）；也可以给切好的目录。

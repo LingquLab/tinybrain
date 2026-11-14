@@ -1,8 +1,8 @@
 """从头到尾做出全部数据：按顺序跑各步，每一步开跑前先检查它要的输入在不在，缺了就停下并说清楚缺什么。
 
-    python -m dataset.build --check          # 只检查：每一步要什么、有没有、会产出什么，不跑
-    python -m dataset.build sft rl           # 只跑这几步
-    python -m dataset.build                  # 全部：download → clean → mix → sft → rl
+    tinybrain data --check          # 只检查：每一步要什么、有没有、会产出什么，不跑
+    tinybrain data sft rl           # 只跑这几步
+    tinybrain data                  # 全部：download → clean → mix → sft → rl
 
 步骤：
     download  下载全部原始数据                                     dataset/download.py

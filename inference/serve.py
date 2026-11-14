@@ -1,4 +1,4 @@
-"""OpenAI 兼容的服务接口：python -m inference.serve out/small/rl/ckpt.pt --port 8001
+"""OpenAI 兼容的服务接口：tinybrain serve out/small/rl/ckpt.pt --port 8001
 
 支持 POST /v1/chat/completions（messages、max_tokens、temperature、top_k、tools）和 GET /v1/models。
 模型写出工具调用时，按 OpenAI 的格式放进 message.tool_calls，finish_reason 是 tool_calls；工具的结果用 role=tool 的消息传回来。

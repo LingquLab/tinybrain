@@ -1,6 +1,6 @@
 """RL：GRPO（带 Dr. GRPO 的修正），奖励可插拔——RLVR、agent RL、RLAIF 都用这一个脚本，区别只在题目文件。
 
-    python -m training.train_rl --steps 200 --judge-url http://localhost:8000/v1    # 默认：从 out/small/sft 出发，data/rl_small.parquet，写到 out/small/rl
+    tinybrain rl --steps 200 --judge-url http://localhost:8000/v1    # 默认：从 out/small/sft 出发，data/rl_small.parquet，写到 out/small/rl
 
 每一步：
   1. 抽 prompts_per_step 道题，每道采 group_size 个回答（agent 题按多轮跑工具）；

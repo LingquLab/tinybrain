@@ -197,8 +197,10 @@ def step_optimizers(optimizers: list[torch.optim.Optimizer]) -> None:
 # ---------- 运行目录：一次完整训练的各个阶段都放在同一个目录下（默认 out/small），每个阶段写到 <运行目录>/<阶段>/ckpt.pt，
 # 下一个阶段不写 --init 时，就从这里找上一个阶段的存档。
 
-STAGE_COMMANDS = {"pretrain": "python -m training.train_pretrain", "anneal": "python -m training.train_pretrain --init <预训练的存档>",
-                  "sft": "python -m training.train_sft", "mopd": "python -m training.train_distill", "rl": "python -m training.train_rl"}
+STAGE_COMMANDS = {"pretrain": "tinybrain pretrain（也就是 python -m training.train_pretrain）",
+                  "anneal": "tinybrain pretrain --init <预训练的存档>（也就是 python -m training.train_pretrain）",
+                  "sft": "tinybrain sft（也就是 python -m training.train_sft）", "mopd": "tinybrain distill（也就是 python -m training.train_distill）",
+                  "rl": "tinybrain rl（也就是 python -m training.train_rl）"}
 
 
 def find_stage(run, stages: tuple) -> Path:
