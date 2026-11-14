@@ -44,7 +44,7 @@ pip install -e ".[data]"          # 要 Python 3.11+、PyTorch 2.5+（用 PyTorc
 **1. 拿到数据**（二选一）
 
 ```bash
-# 直接下做好的（ModelScope，整理中，传完后公开）
+# 直接下做好的（ModelScope：https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset ）
 modelscope download --dataset caiwangzsnm/tinybrain-dataset pretrain_mini.parquet --local_dir data
 
 # 或者自己从头做：下载 → 清洗 → 去重分档 → SFT 语料 → RL 题目

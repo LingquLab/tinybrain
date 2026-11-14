@@ -391,7 +391,7 @@ def dataset_card(report: dict) -> str:
     unclear = [s for s in cat_of if "待确认" in PRETRAIN.get(s, {}).get("license", "") and any(report[t]["source_tokens"].get(s) for t in tiers)]
     lines = ["---", "license: other", "language:", "- zh", "- en", "task_categories:", "- text-generation", "tags:", "- pretraining", "---", "",
              "# tinybrain dataset", "",
-             "tinybrain 的中文为主的混合预训练数据集。", "",
+             "tinybrain 的中文为主的混合预训练数据集。清洗、去重、分档的代码和模型在 https://github.com/cai114514114514/tinybrain 。", "",
              "从 26 个公开来源清洗、跨来源去重后，按配比和质量挑选出的四档预训练数据。四档是套娃关系 nano ⊂ mini ⊂ base ⊂ full："
              "每个来源内部按质量从高到低排，最好的进 nano，往下依次进 mini、base；full 是去重后的全部。每个文件各自完整、内部打乱，只读一个就够。", "",
              "## 文件", "",
