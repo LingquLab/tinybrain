@@ -39,12 +39,14 @@ SMALL_KEEP = 0.5       # small 档每个外部来源留质量好的这么多
 
 EXPERTS = {"math": ("数学",), "code": ("代码",), "literature": ("文学",)}
 
-_OTHER_MODEL = re.compile(r"(?:我是|我叫|作为|身为)[^。\n]{0,8}(?:ChatGPT|GPT-?\d|Claude|通义千问|千问|Qwen|文心一言|Kimi|豆包|DeepSeek|深度求索|Gemini|Llama)"
+_OTHER_MODEL = re.compile(r"(?:我是|我叫|作为|身为)[^。\n]{0,15}(?:ChatGPT|GPT-?\d|Claude|通义千问|千问|Qwen|文心一言|Kimi|豆包|DeepSeek|深度求索|Gemini|Llama)"
                           r"|由\s*(?:OpenAI|Anthropic|阿里巴巴|阿里云|百度|月之暗面|字节跳动|深度求索|Google|Meta)\s*(?:公司)?(?:开发|训练|创建|打造)"
                           # 英文：只认说自己的句子（I am / I'm / As a(n) 开头），「GPT-4 is a model developed by OpenAI」这种讲事实的不算
-                          r"|\b(?:I am|I'm|As an?)\s[^.\n]{0,40}?\b(?:developed|created|trained|built|made)\s+by\s+"
+                          r"|\b(?:I am|I'm|As an?)\s[^.\n]{0,70}?\b(?:developed|created|trained|built|made)\s+by\s+"
                           r"(?:OpenAI|Anthropic|Google|Meta|Alibaba|DeepSeek|Mistral|Microsoft)"
-                          r"|\b(?:I am|I'm)\s+(?:ChatGPT|GPT-?\d|Claude|Gemini|Llama|Qwen|Bard)\b", re.I)
+                          r"|\b(?:I am|I'm)\s+(?:ChatGPT|GPT-?\d|Claude|Gemini|Llama|Qwen|Bard)\b"
+                          r"|\b(?:I am|I'm)\s[^.\n]{0,40}?\b(?:based on|built on|powered by)\s+(?:the\s+)?(?:OpenAI|ChatGPT|GPT|Claude|Gemini|Llama)"
+                          r"|\blike me\b[^.\n]{0,10}(?:developed|created|trained|built|made)\s+by\s+(?:OpenAI|Anthropic|Google|Meta)", re.I)
 _TOOL_CALL_TEXT = re.compile(r"^\[(\w[\w\- ]*)\((.*)\)\]$", re.S)
 
 
