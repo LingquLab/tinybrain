@@ -17,7 +17,7 @@ from .layers.streams import StreamEntry, StreamExit
 
 
 class Output(NamedTuple):
-    logits: torch.Tensor             # (B, T, 词表大小)
+    logits: torch.Tensor | None      # (B, T, 词表大小)；给了 targets 时是 None（只算损失，不留整张输出）
     loss: torch.Tensor | None        # 给了 targets 才有：交叉熵加上均衡损失
     balance_loss: torch.Tensor       # MoE 的均衡损失（已乘权重）；没有 MoE 时是 0
 
@@ -32,6 +32,8 @@ class DecodeState:
 
 
 class LanguageModel(nn.Module):
+    loss_chunk = 4096  # 算损失时每块多少个词
+
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
@@ -97,16 +99,30 @@ class LanguageModel(nn.Module):
             balance = balance + b.float()
         balance = self.cfg.moe_balance_loss * balance
 
-        logits = self.head(self.final_norm(self.exit(x))).float()
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1) + balance
+        h = self.final_norm(self.exit(x))
+        logits = loss = None
+        if targets is None:
+            logits = self.head(h).float()
+        else:
+            loss = self.chunked_loss(h, targets) + balance
         if state is not None:
             state.pos = pos + T
             if self.memory is not None and self.memory.history_len:
                 past = state.history if state.history is not None else idx.new_full((B, self.memory.history_len), self.memory.pad_id)
                 state.history = torch.cat([past, idx], dim=1)[:, -self.memory.history_len:]
         return Output(logits, loss, balance)
+
+    def chunked_loss(self, h: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """交叉熵，和一次算完的结果一样，只是一块一块地过输出层。
+
+        整张输出是「词数 × 词表」那么大：8 × 4096 个词、32768 的词表，单精度一份就是 4 GB，一次算完时前向和反向里会同时
+        有好几份。分块以后同时存在的只有一块的输出，外加反向要用的那一份对数概率。"""
+        h, targets = h.reshape(-1, h.size(-1)), targets.reshape(-1)
+        total = h.new_zeros((), dtype=torch.float32)
+        for start in range(0, targets.numel(), self.loss_chunk):
+            logits = self.head(h[start:start + self.loss_chunk]).float()
+            total = total + F.cross_entropy(logits, targets[start:start + self.loss_chunk], ignore_index=-1, reduction="sum")
+        return total / (targets != -1).sum()
 
     def new_state(self) -> DecodeState:
         return DecodeState(self.cfg.n_layers)

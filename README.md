@@ -55,10 +55,13 @@ python -m dataset.build
 **2. 预训练一个 small**
 
 ```bash
+python -m tools.bench small --batch 4 --seq 4096                                          # 先量这张卡的速度和显存峰值，批大小按它定
 python -m tools.prepare --input data/pretrain_mini.parquet --out data/tokens/mini        # 切词
 python -m training.train_pretrain --data data/tokens/mini --out out/small/pretrain \
-    --preset small --seq-len 4096 --batch-size 8 --epochs 1                               # 中断后加 --resume 接着跑
+    --preset small --seq-len 4096 --batch-size 4 --grad-accum 2 --epochs 1                # 中断后加 --resume 接着跑
 ```
+
+显存不够就把 `--batch-size` 减半、`--grad-accum` 加倍，等效的批大小不变。
 
 **3. 后训练，然后聊两句**
 

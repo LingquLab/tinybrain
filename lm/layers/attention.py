@@ -3,7 +3,8 @@
 三条计算路径：
   1. 看全文，或者序列不比窗口长：直接调 scaled_dot_product_attention（CUDA 上走 flash 内核）。
   2. 序列比窗口长：把序列切成窗口那么长的块，每块的查询只和「上一块加本块」的键算，
-     计算量从 T×T 降到 T×2W。结果和逐位置加掩码完全一样。
+     计算量从 T×T 降到 T×2W。结果和逐位置加掩码完全一样。这一步带掩码，键值先按组复制到和查询一样多的头：
+     多数 PyTorch 版本里，带掩码能用的融合内核不支持分组查询，不复制就会退回把整张注意力矩阵算出来的慢路径。
   3. 逐词生成：新来的一个词和缓存里的键值算，窗口层的缓存只留最近 W 个。
 """
 import torch
@@ -71,6 +72,8 @@ class Attention(nn.Module):
         qb = blocks(q, 1, n_blocks).reshape(-1, self.n_heads, W, D)
         kb = torch.cat([blocks(k, 0, n_blocks - 1), blocks(k, 1, n_blocks)], dim=-2).reshape(-1, self.n_kv_heads, 2 * W, D)
         vb = torch.cat([blocks(v, 0, n_blocks - 1), blocks(v, 1, n_blocks)], dim=-2).reshape(-1, self.n_kv_heads, 2 * W, D)
-        rest = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=self.block_mask, enable_gqa=True)
+        group = self.n_heads // self.n_kv_heads
+        kb, vb = kb.repeat_interleave(group, dim=1), vb.repeat_interleave(group, dim=1)
+        rest = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=self.block_mask)
         rest = rest.view(B, n_blocks - 1, self.n_heads, W, D).transpose(1, 2).reshape(B, self.n_heads, -1, D)
         return torch.cat([first, rest], dim=2)[:, :, :T]
