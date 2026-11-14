@@ -19,7 +19,7 @@ class Block(nn.Module):
         self.engram = EngramGate(cfg.engram_dim, cfg.dim, cfg.n_streams) if index in cfg.engram_layers else None
         self.attn = Attention(cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.window_of(index))
         self.attn_norm, self.ffn_norm = RMSNorm(cfg.dim), RMSNorm(cfg.dim)
-        if cfg.moe_experts:
+        if cfg.is_moe_layer(index):
             self.ffn = MoE(cfg.dim, cfg.moe_experts, cfg.moe_top_k, int(cfg.moe_hidden_mult * cfg.dim), int(cfg.moe_shared_mult * cfg.dim),
                            cfg.moe_latent_dim, cfg.moe_balance_rate)
         else:
