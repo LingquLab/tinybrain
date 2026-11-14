@@ -65,6 +65,19 @@ def compile_model(model: torch.nn.Module, device: torch.device, enabled: bool = 
     return torch.compile(model, dynamic=False, options=options)
 
 
+@torch.no_grad()
+def saturated_share(model, x: torch.Tensor, y: torch.Tensor, device: torch.device) -> float:
+    """正确答案的领先量超过 FP32 临界值（约 16.6）的词占多少（arXiv 2610.31642 说的 softmax 塌缩）。
+
+    超过这个值，标准交叉熵里正确项的梯度会舍入成 0。只看第一行，整张输出也就「一行词数 × 词表」那么大。
+    用未编译的模型，免得编译后的前向为「要输出」再编一遍。"""
+    from lm.loss import margin_saturation
+    raw = getattr(model, "_orig_mod", model)
+    with autocast(device):
+        logits = raw(x[:1], return_logits=True).logits
+    return margin_saturation(logits, y[:1])
+
+
 def peak_memory_gb(device: torch.device) -> float | None:
     return torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None
 
@@ -191,6 +204,9 @@ def add_optimizer_args(parser, lr_mult: float = 1.0) -> None:
     g.add_argument("--engram-lr", type=float, default=0.3, help="Engram 记忆表（不做权重衰减）")
     g.add_argument("--scalar-lr", type=float, default=0.01, help="归一化系数、多流残差系数、流入口出口的查询向量")
     g.add_argument("--weight-decay", type=float, default=0.0, help="只作用在 Muon 管的矩阵上")
+    g.add_argument("--adam-eps", type=float, default=1e-10,
+                   help="Adam 的 ε。论文 arXiv 2610.31642：ε 越小，正确答案的领先幅度平衡在约 ln(1/ε)；1e-10 时约 23，超过 FP32 的临界值 16.6，"
+                        "CUDA 上的融合交叉熵会出现梯度算错的位置；改成 1e-7 能避开，但会改变词向量、输出层、记忆表的学习动态")
     g.add_argument("--clip-grad", type=float, default=1.0, help="梯度裁剪：所有梯度合起来的范数超过它就按比例缩小；0 表示不裁剪")
     g.add_argument("--muon-momentum", choices=["float32", "bfloat16"], default="float32", help="Muon 动量的精度；bfloat16 省一半显存")
     g.add_argument("--offload-adam", action="store_true", help="Adam 那几组的状态放到 CPU 上（要 CUDA 和 torchao），显存紧时用")
@@ -198,7 +214,7 @@ def add_optimizer_args(parser, lr_mult: float = 1.0) -> None:
 
 def optimizers_from_args(model: LanguageModel, args) -> list[torch.optim.Optimizer]:
     return build_optimizers(model, args.optimizer, matrix_lr=args.matrix_lr, embed_lr=args.embed_lr, head_lr=args.head_lr,
-                            engram_lr=args.engram_lr, scalar_lr=args.scalar_lr, weight_decay=args.weight_decay,
+                            engram_lr=args.engram_lr, scalar_lr=args.scalar_lr, weight_decay=args.weight_decay, adam_eps=args.adam_eps,
                             muon_momentum_dtype=torch.bfloat16 if args.muon_momentum == "bfloat16" else None, offload_adam=args.offload_adam)
 
 

@@ -2,12 +2,12 @@
 from dataclasses import dataclass, field
 
 import torch
-import torch.nn.functional as F
 
 from inference.generate import generate
 from inference.template import ChatFormat
 from inference.tokenizer import PAD
 from lm import LanguageModel
+from lm.loss import token_log_probs
 
 
 @dataclass
@@ -99,6 +99,5 @@ def collate(episodes: list[Episode], device: torch.device) -> tuple[torch.Tensor
 
 
 def token_logprobs(model: LanguageModel, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """每个位置上，模型给目标词的对数概率，(B, T)。"""
-    logits = model(x).logits
-    return torch.gather(F.log_softmax(logits, dim=-1), -1, y.unsqueeze(-1)).squeeze(-1)
+    """每个位置上，模型给目标词的对数概率，(B, T)。用稳定写法（lm/loss.py）：把握极大的词梯度也不会算错，RL 后期这样的词很多。"""
+    return token_log_probs(model(x).logits, y)

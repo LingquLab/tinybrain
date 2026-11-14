@@ -28,7 +28,7 @@ from lm import PRESETS, LanguageModel, ModelConfig, preset
 
 from .dataset import open_mixed
 from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, compile_model, count, format_eta, load_checkpoint, lr_scale, optimizers_from_args,
-                            pick_device, resume, save_checkpoint, set_lr_scale, setup_device, step_optimizers)
+                            pick_device, resume, saturated_share, save_checkpoint, set_lr_scale, setup_device, step_optimizers)
 
 MODEL_ARGS = ("dim", "n_layers", "n_heads", "n_kv_heads", "max_seq_len", "window", "moe_experts")  # 命令行上能直接改的模型设置
 
@@ -68,8 +68,9 @@ def build_model(args, vocab_size: int, device: torch.device) -> tuple[LanguageMo
 
 
 @torch.no_grad()
-def evaluate(model, data, args, device: torch.device) -> float:
-    """验证集上的平均损失（不含 MoE 的均衡损失）。每次用同一批片段，前后才可比。"""
+def evaluate(model, data, args, device: torch.device) -> tuple[float, float]:
+    """验证集上的平均损失（不含 MoE 的均衡损失）。每次用同一批片段，前后才可比。
+    第二个返回值是第一行里 softmax 塌缩的词占比（见 trainer_utils.saturated_share）。"""
     was_training = model.training
     model.eval()
     total = 0.0
@@ -78,8 +79,10 @@ def evaluate(model, data, args, device: torch.device) -> float:
         with autocast(device):
             out = model(x, y, return_logits=False)
         total += (out.loss - out.balance_loss).item()
+        if i == 0:
+            saturated = saturated_share(model, x, y, device)
     model.train(was_training)
-    return total / args.eval_batches
+    return total / args.eval_batches, saturated
 
 
 def total_steps(args, windows: int) -> int:
@@ -182,9 +185,9 @@ def train(args) -> dict:
                       f"学习率×{scale:.3f}" + (f"  梯度 {float(grad_norm):.2f}" if grad_norm is not None else "") +
                       f"  每秒 {speed:,.0f} 词  剩余 {eta}", flush=True)
             if val_data and (done % args.eval_every == 0 or done == steps):
-                val_loss = evaluate(forward, val_data, args, device)
-                record = {**(record or dict(step=done)), "val_loss": round(val_loss, 4)}
-                print(f"第 {done:>7} 步  验证集损失 {val_loss:.4f}", flush=True)
+                val_loss, saturated = evaluate(forward, val_data, args, device)
+                record = {**(record or dict(step=done)), "val_loss": round(val_loss, 4), "saturated": round(saturated, 6)}
+                print(f"第 {done:>7} 步  验证集损失 {val_loss:.4f}  塌缩 {saturated:.2%}", flush=True)
                 last_time = time.perf_counter()  # 验证花的时间不算进训练速度
             if record:
                 log.write(json.dumps(record) + "\n")

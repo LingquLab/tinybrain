@@ -131,7 +131,7 @@ lm/                    模型的定义，只有模型（一个文件一个概念
     streams.py             多条流的入口和出口（用注意力）
     block.py               一层 = 记忆注入 + 注意力 + 前馈
     norm.py / rotary.py    归一化、位置编码
-  loss.py                输出层加交叉熵（CUDA 上用 Liger 的融合内核，否则分块算）
+  loss.py                输出层加交叉熵（CUDA 上用 Liger 的融合内核，否则分块算；不会塌缩的写法）
   checkpointing.py       逐层激活重计算
 training/              训练；每个阶段一个脚本，从头读到尾就是这个阶段的全部，参数都在文件末尾的 parse_args 里
   train_pretrain.py      预训练（也用于退火：--init 从存档出发，--data 按比例混合几份数据）
@@ -188,48 +188,48 @@ out/                   训练输出（不进仓库）：out/<尺寸>/<阶段>/ �
 
 ### 多流残差（mHC）
 
-普通残差只有一条流：$x \leftarrow x + F(x)$。tinybrain 把残差拓宽成 $n=4$ 条流 $X \in \mathbb{R}^{n \times d}$，每个子层（注意力、前馈各算一个）有三组可学的系数：
+普通残差只有一条流：$`x \leftarrow x + F(x)`$。tinybrain 把残差拓宽成 $`n=4`$ 条流 $`X \in \mathbb{R}^{n \times d}`$，每个子层（注意力、前馈各算一个）有三组可学的系数：
 
-$$
+```math
 X \leftarrow H^{\text{res}} X + h^{\text{post}} \otimes F\!\left(\textstyle\sum_{s} h^{\text{pre}}_s X_s\right)
-$$
+```
 
-- **读** $h^{\text{pre}} = \sigma(\cdot) \in (0,1)^n$：把 4 条流加权合成这个子层的输入；
-- **写** $h^{\text{post}} = 2\sigma(\cdot) \in (0,2)^n$：子层的输出按多大比例加回每条流；
-- **混** $H^{\text{res}} \in \mathbb{R}^{n\times n}$：流和流之间互相搬运。它被约束成**双随机矩阵**（每行每列和为 1），所以信号总量在层与层之间不会被放大或缩小——这是 mHC 相对原始 Hyper-Connections 的改进，解决了深层训练不稳。
+- **读** $`h^{\text{pre}} = \sigma(\cdot) \in (0,1)^n`$：把 4 条流加权合成这个子层的输入；
+- **写** $`h^{\text{post}} = 2\sigma(\cdot) \in (0,2)^n`$：子层的输出按多大比例加回每条流；
+- **混** $`H^{\text{res}} \in \mathbb{R}^{n\times n}`$：流和流之间互相搬运。它被约束成**双随机矩阵**（每行每列和为 1），所以信号总量在层与层之间不会被放大或缩小——这是 mHC 相对原始 Hyper-Connections 的改进，解决了深层训练不稳。
 
-双随机用 Sinkhorn 迭代得到：对 $\exp(\text{logits})$ 交替按列、按行归一，在对数域里做 20 次：
+双随机用 Sinkhorn 迭代得到：对 $`\exp(\text{logits})`$ 交替按列、按行归一，在对数域里做 20 次：
 
-$$
+```math
 \log M \leftarrow \log M - \operatorname{logsumexp}_{\text{行}}(\log M),\qquad \log M \leftarrow \log M - \operatorname{logsumexp}_{\text{列}}(\log M)
-$$
+```
 
-这里用的是**静态**版：系数不看输入，整个模型所有子层的系数放在一起一次算完，几乎不花时间。初始化让它等价于普通残差（$H^{\text{res}} \approx I$，第 $s$ 个子层主要读第 $s \bmod n$ 条流）。代码：`lm/layers/hyper.py`。
+这里用的是**静态**版：系数不看输入，整个模型所有子层的系数放在一起一次算完，几乎不花时间。初始化让它等价于普通残差（$`H^{\text{res}} \approx I`$，第 $`s`$ 个子层主要读第 $`s \bmod n`$ 条流）。代码：`lm/layers/hyper.py`。
 
 ### Engram：查表记忆
 
-很多知识是「看到这几个字就该想起什么」，用矩阵乘去算有点浪费。Engram 直接按「前 $n-1$ 个词 + 当前词」查表：对阶数 $n \in \{2, 3\}$、每个哈希头 $h$（8 个），
+很多知识是「看到这几个字就该想起什么」，用矩阵乘去算有点浪费。Engram 直接按「前 $`n-1`$ 个词 + 当前词」查表：对阶数 $`n \in \{2, 3\}`$、每个哈希头 $`h`$（8 个），
 
-$$
+```math
 \text{row}_{n,h}(p) = \Big(\bigoplus_{j=0}^{n-1} t_{p-j}\cdot m_{n,h,j}\Big) \bmod P_{n,h} + \text{offset}_{n,h}
-$$
+```
 
-$t_{p-j}$ 是往前第 $j$ 个词的编号，$m$ 是固定的随机奇数乘数，$\oplus$ 是按位异或，$P_{n,h}$ 是互不相同的质数（不同哈希头的碰撞不会成对出现）。每个位置取回 $2 \times 8$ 行、每行宽 32（small）的向量，拼起来、归一化。
+$`t_{p-j}`$ 是往前第 $`j`$ 个词的编号，$`m`$ 是固定的随机奇数乘数，$`\oplus`$ 是按位异或，$`P_{n,h}`$ 是互不相同的质数（不同哈希头的碰撞不会成对出现）。每个位置取回 $`2 \times 8`$ 行、每行宽 32（small）的向量，拼起来、归一化。
 
 取回的记忆用两次：
 
-1. **入口**：每个阶数投影成一份 $d$ 维的「来源」，和词向量一起交给流入口；
+1. **入口**：每个阶数投影成一份 $`d`$ 维的「来源」，和词向量一起交给流入口；
 2. **门控注入**：在第 1 层（medium、large 再加中间一层）之前，每条流拿自己当前的状态和记忆的「键」比一比，决定收多少：
 
-$$
+```math
 g_s = \sigma\!\left(\frac{\langle \text{RMSNorm}(X_s),\ \text{RMSNorm}(K_s\,e)\rangle}{\sqrt{d}}\right),\qquad X_s \leftarrow X_s + g_s \cdot V e
-$$
+```
 
 记忆表查一次只取十几行，**不花算力，只占显存**。所以记忆表都做得很大：small、medium 占「主干 + 记忆表」参数的 45%（`ENGRAM_SHARE`）；large 是 MoE，按 Engram 论文的最优点，占「每个词用不到的参数」的 25%（`ENGRAM_SPARSE_SHARE`）。代码：`lm/layers/engram.py`。
 
 ### 流的入口和出口
 
-- **入口**：一个位置有三份来源（词向量、二元记忆、三元记忆）。每条流 $m$ 有一个自己的查询向量 $q_m$，对来源打分、加权求和：$X_m = \sum_s \operatorname{softmax}_s\!\big(q_m^\top k_s / \sqrt{d_k}\big)\, \text{src}_s$。不同的流可以偏好不同的来源。
+- **入口**：一个位置有三份来源（词向量、二元记忆、三元记忆）。每条流 $`m`$ 有一个自己的查询向量 $`q_m`$，对来源打分、加权求和：$`X_m = \sum_s \operatorname{softmax}_s\!\big(q_m^\top k_s / \sqrt{d_k}\big)\, \text{src}_s`$。不同的流可以偏好不同的来源。
 - **出口**：一个可学的查询向量对 4 条流打分、加权合成一份。查询从零开始，所以一开始就是 4 条流的平均。
 
 代码：`lm/layers/streams.py`。
@@ -239,27 +239,27 @@ $$
 - **分组查询注意力（GQA）**：small 有 12 个查询头、3 组键值头，键值缓存小到四分之一；
 - **QK 归一化**：查询和键先过 RMSNorm 再做点积，训练更稳；
 - **旋转位置编码（RoPE）**，底数 10000，上下文 8192；
-- **滑动窗口 3:1**：每 4 层里前 3 层只看最近 1024 个词，第 4 层（以及最后一层）看全文。CUDA 上用 FlexAttention：窗口和因果写成一条掩码规则，编成块稀疏的掩码，只算窗口里的那条带子，计算量从 $T^2$ 降到约 $WT$，原生支持分组查询；CPU、MPS 上用带掩码的 scaled_dot_product_attention，结果一样。
+- **滑动窗口 3:1**：每 4 层里前 3 层只看最近 1024 个词，第 4 层（以及最后一层）看全文。CUDA 上用 FlexAttention：窗口和因果写成一条掩码规则，编成块稀疏的掩码，只算窗口里的那条带子，计算量从 $`T^2`$ 降到约 $`WT`$，原生支持分组查询；CPU、MPS 上用带掩码的 scaled_dot_product_attention，结果一样。
 
 代码：`lm/layers/attention.py`。
 
 ### 前馈和混合专家
 
-普通前馈层用 ReLU²：$\text{FFN}(x) = W_2\,\text{ReLU}(W_1 x)^2$，中间宽度 4d。
+普通前馈层用 ReLU²：$`\text{FFN}(x) = W_2\,\text{ReLU}(W_1 x)^2`$，中间宽度 4d。
 
 large 档换成混合专家：第 1 层仍是普通前馈；其余各层是 2 个**共享专家**（和路由专家同宽，合起来就是一个半宽的前馈层），加上从 48 个四分之一宽的路由专家里选 8 个。按宽度算，每个词用到全部专家的 20%：
 
-$$
+```math
 s = \sqrt{\operatorname{softplus}(W_r z)},\qquad \mathcal{K} = \operatorname{top\text{-}k}(s + b),\qquad y = \text{FFN}_{\text{shared}}(x) + \sum_{e \in \mathcal{K}} \frac{s_e}{\sum_{e' \in \mathcal{K}} s_{e'}}\,\text{FFN}_e(z)
-$$
+```
 
 负载均衡有两层：
-- **偏置均衡**（不参与求导）：每个专家有一个偏置 $b_e$，只在「挑谁」时加上。每步按实际负载调整：$b_e \leftarrow b_e + \gamma \cdot \operatorname{sign}(1/E - \text{load}_e)$，$\gamma = 10^{-3}$。活儿多的专家偏置降一点，下次就少被挑。
-- **很轻的均衡损失**：$\mathcal{L}_{\text{bal}} = E \sum_e \text{load}_e \cdot \text{share}_e$，权重 $10^{-4}$。$\text{load}_e$ 是专家实际接了多大比例的词，$\text{share}_e$ 是它平均拿到多大比例的分数。
+- **偏置均衡**（不参与求导）：每个专家有一个偏置 $`b_e`$，只在「挑谁」时加上。每步按实际负载调整：$`b_e \leftarrow b_e + \gamma \cdot \operatorname{sign}(1/E - \text{load}_e)`$，$`\gamma = 10^{-3}`$。活儿多的专家偏置降一点，下次就少被挑。
+- **很轻的均衡损失**：$`\mathcal{L}_{\text{bal}} = E \sum_e \text{load}_e \cdot \text{share}_e`$，权重 $`10^{-4}`$。$`\text{load}_e`$ 是专家实际接了多大比例的词，$`\text{share}_e`$ 是它平均拿到多大比例的分数。
 
 可选 LatentMoE：先把输入压到更窄的宽度，路由和专家都在压缩后的空间里算，最后再升回来。代码：`lm/layers/moe.py`。
 
-**为什么这么配**（对照了 20 个公开 MoE 的配置）：2024 年以后的 MoE 激活比例几乎都在 12.5% 以下，和我们尺寸接近的小 MoE 用 32–64 个专家（Granite-1B 是 32 选 8、OLMoE 是 64 选 8）；专家宽度多是模型宽度的 0.25–0.5 倍；DeepSeek、Kimi、GLM、Moonlight 让第 1 层保持普通前馈、配一两个窄的共享专家（Qwen3、OLMoE、Granite 不用共享专家，这一点没有共识）。蚂蚁的效率杠杆论文给出的最优粒度 $2d/w$ 在 8–12，我们是 8。记忆表的大小也跟着 MoE 走：Engram 论文发现，每个词用不到的参数（没选中的专家 + 记忆表）里，记忆表占 20–25% 最好，large 取 25%。
+**为什么这么配**（对照了 20 个公开 MoE 的配置）：2024 年以后的 MoE 激活比例几乎都在 12.5% 以下，和我们尺寸接近的小 MoE 用 32–64 个专家（Granite-1B 是 32 选 8、OLMoE 是 64 选 8）；专家宽度多是模型宽度的 0.25–0.5 倍；DeepSeek、Kimi、GLM、Moonlight 让第 1 层保持普通前馈、配一两个窄的共享专家（Qwen3、OLMoE、Granite 不用共享专家，这一点没有共识）。蚂蚁的效率杠杆论文给出的最优粒度 $`2d/w`$ 在 8–12，我们是 8。记忆表的大小也跟着 MoE 走：Engram 论文发现，每个词用不到的参数（没选中的专家 + 记忆表）里，记忆表占 20–25% 最好，large 取 25%。
 
 ### 其他细节
 
@@ -363,9 +363,23 @@ tinybrain pretrain --help     # 全部参数：模型（--dim、--n-layers……
 
 下一个词预测，所有位置都算交叉熵；有 MoE 时加上均衡损失：
 
-$$
+```math
 \mathcal{L} = -\frac{1}{T}\sum_{t=1}^{T} \log p_\theta(x_{t} \mid x_{<t}) + 10^{-4}\,\mathcal{L}_{\text{bal}}
-$$
+```
+
+**模型很有把握时的梯度（softmax 塌缩）。** Barron 等（Google DeepMind，[arXiv 2610.31642](https://arxiv.org/abs/2610.31642)，按 v3）指出：标准实现里正确词的梯度是 $`p_t - 1`$。设正确词领先其余所有词的间隔为
+
+```math
+m = z_t - \operatorname{LSE}_{j \neq t}\, z_j
+```
+
+$`m`$ 超过约 16.6（FP32；BF16 约 5.5）时，$`p_t`$ 舍入成 1，正确项的梯度变成 0，其余词的梯度却还是正的，整份梯度加起来不再是 0。`lm/loss.py` 换成数学上相等、但不会舍入掉的写法：
+
+```math
+\ell = \operatorname{softplus}(-m),\qquad \frac{\partial \ell}{\partial z_t} = -\sigma(-m)
+```
+
+$`m`$ 用 $`-\operatorname{LSE}_{j\neq t}(z_j - z_t)`$ 来算，其余词全是 $`-\infty`$ 时先截到 $`-10^4`$（v3 勘误里的 NaN）。CPU/MPS 的分块损失、要整张输出时的损失、强化学习里的对数概率都走这条路；CUDA 上的 Liger 融合内核还是标准写法。论文还给出：用 Adam 加权重衰减时，间隔会停在 $`\ln(1/\varepsilon)`$ 附近。我们的默认 $`\varepsilon = 10^{-10}`$ 对应约 23，已经越过 FP32 的临界值，所以验证时日志里多一列 `saturated`（第一行里间隔超过临界值的词占比，屏幕上显示为「塌缩」）。它在 CUDA 上明显不是 0 时，可以加 `--adam-eps 1e-7`（对应约 16.1）。
 
 ### 按轮数训
 
@@ -375,23 +389,23 @@ $$
 
 **Muon**（`training/muon.py`）管所有矩阵（注意力、前馈、专家、各种投影）。思路是：先做动量，再把更新量「正交化」——让它的奇异值都接近 1，这样每个方向走的步子一样大，不会被少数几个大方向主导：
 
-$$
+```math
 B \leftarrow \mu B + (1-\mu) G,\qquad U = (1-\mu) G + \mu B\ \ (\text{Nesterov}),\qquad O = \operatorname{NS}_5(U)
-$$
+```
 
-$$
+```math
 W \leftarrow (1 - \eta\lambda)\,W - \eta \sqrt{\max(1,\ m/n)}\; O
-$$
+```
 
-$\operatorname{NS}_5$ 是 5 次 Newton–Schulz 迭代，不用做 SVD：
+$`\operatorname{NS}_5`$ 是 5 次 Newton–Schulz 迭代，不用做 SVD：
 
-$$
+```math
 X_0 = U / \lVert U \rVert,\qquad A = X X^\top,\qquad X \leftarrow aX + (bA + cA^2)\,X,\qquad (a, b, c) = (3.4445,\ -4.7750,\ 2.0315)
-$$
+```
 
 形状相同的矩阵叠在一起一次算完；CUDA 上用 bf16 算正交化。`--optimizer native` 换成 PyTorch 自带的 `torch.optim.Muon`（两条路径的更新结果几乎一样，有测试对照）。
 
-**Adam** 管词向量、输出层、记忆表和零碎的系数（$\beta = (0.8, 0.95)$），学习率按 $(d/768)^{-1/2}$ 缩放：
+**Adam** 管词向量、输出层、记忆表和零碎的系数（$`\beta = (0.8, 0.95)`$），学习率按 $`(d/768)^{-1/2}`$ 缩放：
 
 | 参数组 | 起步学习率 | 命令行 |
 |---|---|---|
@@ -405,11 +419,11 @@ $$
 
 ### 学习率曲线
 
-先线性预热，再按余弦降到起步值的 $f$ 倍（`--final-lr-frac`，预训练默认 0.1）：
+先线性预热，再按余弦降到起步值的 $`f`$ 倍（`--final-lr-frac`，预训练默认 0.1）：
 
-$$
+```math
 \text{scale}(t) = \begin{cases} \dfrac{t+1}{T_w} & t < T_w \\[2mm] f + (1-f)\cdot\dfrac{1 + \cos(\pi p)}{2},\quad p = \dfrac{t - T_w}{T - T_w} & t \ge T_w \end{cases}
-$$
+```
 
 每组的学习率 = 起步值 × scale(t) × `--lr-mult`。
 
@@ -460,11 +474,11 @@ tinybrain pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_mini.p
 疑是地上霜。<|im_end|>
 ```
 
-**只在回答上算损失**：每个位置带一个遮罩 $m_t \in \{0,1\}$，只有助手的回答和它后面的 `<|im_end|>` 是 1：
+**只在回答上算损失**：每个位置带一个遮罩 $`m_t \in \{0,1\}`$，只有助手的回答和它后面的 `<|im_end|>` 是 1：
 
-$$
+```math
 \mathcal{L}_{\text{SFT}} = -\frac{\sum_t m_t \log p_\theta(x_t \mid x_{<t})}{\sum_t m_t}
-$$
+```
 
 对话按长度打包成等长的行（一段对话不拆到两行，行尾用填充补齐），按轮数训（`--epochs`），学习率默认是预训练的 0.1 倍。
 
@@ -476,51 +490,51 @@ $$
 
 把几个专家的本事合回一个通用模型。做法是让**学生自己生成回答**，再让对应领域的专家逐位置给出它的概率分布，最小化学生对老师的**反向 KL**：
 
-$$
+```math
 \mathcal{L}_{\text{MOPD}} = \frac{1}{\sum_i |y_i|}\sum_i \sum_{t \in y_i} \sum_{v \in V} \pi_\theta(v \mid h_{i,t}) \Big[\log \pi_\theta(v \mid h_{i,t}) - \log \pi_{T(d_i)}(v \mid h_{i,t})\Big]
-$$
+```
 
-- $y_i \sim \pi_\theta$ 是学生自己写的回答，$h_{i,t}$ 是提示加上回答的前 $t$ 个词；
-- $T(d_i)$ 是第 $i$ 道题的老师，按领域 $d_i$ 路由：数学、代码、文学各有专家；逻辑题交给数学专家，阅读、诗词、写作交给文学专家，指令跟随、科学、工具调用和通用题交给 SFT 模型自己（`training/train_distill.py` 的 `ROUTES`，`--route 领域=老师` 可以改）；
+- $`y_i \sim \pi_\theta`$ 是学生自己写的回答，$`h_{i,t}`$ 是提示加上回答的前 $`t`$ 个词；
+- $`T(d_i)`$ 是第 $`i`$ 道题的老师，按领域 $`d_i`$ 路由：数学、代码、文学各有专家；逻辑题交给数学专家，阅读、诗词、写作交给文学专家，指令跟随、科学、工具调用和通用题交给 SFT 模型自己（`training/train_distill.py` 的 `ROUTES`，`--route 领域=老师` 可以改）；
 - 学生和老师用同一个分词器，所以 KL 在**整个词表上精确地算**，不是只靠采样出的那一个词去估。
 
-**为什么是在线、为什么是反向 KL**：普通蒸馏让学生模仿老师写好的文本，学生训练时只见过「老师的前文」，自己生成时一旦写偏就没见过这种情况（暴露偏差）。在线蒸馏在学生自己的回答上纠错，正好覆盖它会犯的错。反向 KL $\text{KL}(\pi_\theta \Vert \pi_T)$ 是「寻峰」的：学生只需要把概率放在老师认可的地方，不用强行覆盖老师的所有可能——对容量小的学生更合适。
+**为什么是在线、为什么是反向 KL**：普通蒸馏让学生模仿老师写好的文本，学生训练时只见过「老师的前文」，自己生成时一旦写偏就没见过这种情况（暴露偏差）。在线蒸馏在学生自己的回答上纠错，正好覆盖它会犯的错。反向 KL $`\text{KL}(\pi_\theta \Vert \pi_T)`$ 是「寻峰」的：学生只需要把概率放在老师认可的地方，不用强行覆盖老师的所有可能——对容量小的学生更合适。
 
-`--merge-init`：开始前先做任务算术，把学生换成 $\theta \leftarrow \theta + \frac{1}{K}\sum_k (\theta_k - \theta)$（各专家相对 SFT 模型的改动取平均）。
+`--merge-init`：开始前先做任务算术，把学生换成 $`\theta \leftarrow \theta + \frac{1}{K}\sum_k (\theta_k - \theta)`$（各专家相对 SFT 模型的改动取平均）。
 
 ### RL：从 PPO 到 GRPO，再到我们的写法
 
-**PPO** 的策略损失（每个位置 $t$）：
+**PPO** 的策略损失（每个位置 $`t`$）：
 
-$$
+```math
 \mathcal{L}^{\text{PPO}} = -\mathbb{E}_t\Big[\min\big(\rho_t A_t,\ \operatorname{clip}(\rho_t,\,1-\epsilon,\,1+\epsilon)\,A_t\big)\Big],\qquad \rho_t = \frac{\pi_\theta(y_t \mid h_t)}{\pi_{\theta_{\text{old}}}(y_t \mid h_t)}
-$$
+```
 
-- $\rho_t$ 是新旧策略的概率比：同一批回答要用来更新好几次，更新后的策略和采样时的不一样了，所以要按比例修正；
-- $\operatorname{clip}$ 不让一次更新走太远；
-- 优势 $A_t$ 要一个**价值模型**（critic）来估，和策略一样大，训练和显存都翻倍。
+- $`\rho_t`$ 是新旧策略的概率比：同一批回答要用来更新好几次，更新后的策略和采样时的不一样了，所以要按比例修正；
+- $`\operatorname{clip}`$ 不让一次更新走太远；
+- 优势 $`A_t`$ 要一个**价值模型**（critic）来估，和策略一样大，训练和显存都翻倍。
 
-**GRPO**（DeepSeekMath）去掉了价值模型：每道题采一组 $G$ 个回答，用**组内比较**当优势：
+**GRPO**（DeepSeekMath）去掉了价值模型：每道题采一组 $`G`$ 个回答，用**组内比较**当优势：
 
-$$
+```math
 A_i = \frac{r_i - \operatorname{mean}(r_1, \dots, r_G)}{\operatorname{std}(r_1, \dots, r_G)}
-$$
+```
 
-并且每个回答的损失按它的长度 $|y_i|$ 平均。
+并且每个回答的损失按它的长度 $`|y_i|`$ 平均。
 
 **Dr. GRPO** 指出这两处会带偏：除以标准差，会让「几乎全对或全错」的简单题、难题权重过大；按长度平均，会让答错的长回答每个词受的惩罚变小，模型于是越答越长。改法是**不除标准差、用一个常数代替长度**。
 
-**tinybrain 的写法**（`training/train_rl.py`）：在 Dr. GRPO 的基础上，每批回答**只更新一次**（完全在线）。这时 $\theta = \theta_{\text{old}}$，$\rho_t = 1$，clip 不起作用，min 里两项一样，PPO 的梯度正好退化成带组内基线的策略梯度。所以损失直接写成：
+**tinybrain 的写法**（`training/train_rl.py`）：在 Dr. GRPO 的基础上，每批回答**只更新一次**（完全在线）。这时 $`\theta = \theta_{\text{old}}`$，$`\rho_t = 1`$，clip 不起作用，min 里两项一样，PPO 的梯度正好退化成带组内基线的策略梯度。所以损失直接写成：
 
-$$
+```math
 \mathcal{L}_{\text{RL}} = -\frac{1}{N \cdot L_{\max}} \sum_{i=1}^{N} A_i \sum_{t \in y_i} \log \pi_\theta(y_{i,t} \mid h_{i,t}),\qquad A_i = r_i - \frac{1}{G}\sum_{j \in \text{组}(i)} r_j
-$$
+```
 
-$N$ 是这一步的回答总数（每步题数 × 每题回答数），$L_{\max}$ 是回答长度上限（`--max-new`），两个都是常数。整组奖励一样的题优势全是 0，不贡献梯度。agent 题里工具返回的内容不是模型写的，遮掉不算。没有价值模型，也没有参考模型的 KL 惩罚。
+$`N`$ 是这一步的回答总数（每步题数 × 每题回答数），$`L_{\max}`$ 是回答长度上限（`--max-new`），两个都是常数。整组奖励一样的题优势全是 0，不贡献梯度。agent 题里工具返回的内容不是模型写的，遮掉不算。没有价值模型，也没有参考模型的 KL 惩罚。
 
 RLVR、agent RL、RLAIF 用的是同一个训练器，区别只在题目和奖励：
 
-| 题型 | 奖励 $r$ | 题目来源 | 用在 |
+| 题型 | 奖励 $`r`$ | 题目来源 | 用在 |
 |---|---|---|---|
 | math | 最终答案（`\boxed{}` 或「答案是」）和标准答案相等（按数值比）→ 1，否则 0 | Big-Math-RL-Verified（挑 8B 模型解题率 0.2–0.95 的）、DeepScaleR、GSM8K_zh | medium、large |
 | code | 在沙箱里跑测试用例，全过 → 1 | DeepCoder-Preview 训练集；评测用其中的 Codeforces | medium、large |
@@ -530,10 +544,10 @@ RLVR、agent RL、RLAIF 用的是同一个训练器，区别只在题目和奖�
 | reading | 和参考答案按字算 F1，取最好的参考 | CMRC2018 | 三档 |
 | cloze | 去掉标点后和标准答案完全一样 → 1（回答不能长到把整首诗都写上） | 从诗词里出：给作者、题目、上句，写下句 | 三档 |
 | agent | 答案对 → 1；工具调用格式坏一次 −0.1 | 程序生成：大数运算、百分比、取模、日期、在维基资料里检索 | 三档 |
-| judge | 评审打分 $s \in [1,10]$，$r = (s - 5.5)/4.5 \in [-1, 1]$ | 留出的通用问题；鲁迅续写（附原文参考） | 三档 |
-| poetry | $r = 2\big(0.4\,r_{\text{格律}} + 0.6\,\tfrac{s-1}{9}\big) - 1$；字数句数不对时评审分减半 | 真实诗题，五绝、七绝、五律、七律 | 三档 |
+| judge | 评审打分 $`s \in [1,10]`$，$`r = (s - 5.5)/4.5 \in [-1, 1]`$ | 留出的通用问题；鲁迅续写（附原文参考） | 三档 |
+| poetry | $`r = 2\big(0.4\,r_{\text{格律}} + 0.6\,\tfrac{s-1}{9}\big) - 1`$；字数句数不对时评审分减半 | 真实诗题，五绝、七绝、五律、七律 | 三档 |
 
-**格律分**（`training/rewards/poetry.py`）：句数、每句字数要对，否则 0；对了以后 $r_{\text{格律}} = 0.3 + 0.35\,r_{\text{押韵}} + 0.35\,r_{\text{平仄}}$。押韵看偶数句末字是否同韵且平声；平仄按「一三五不论，二四六分明」，在仄起、平起两种格式里取对得更好的。平仄和韵部用 pypinyin 按普通话近似，入声字会判错（这是已知的简化）。
+**格律分**（`training/rewards/poetry.py`）：句数、每句字数要对，否则 0；对了以后 $`r_{\text{格律}} = 0.3 + 0.35\,r_{\text{押韵}} + 0.35\,r_{\text{平仄}}`$。押韵看偶数句末字是否同韵且平声；平仄按「一三五不论，二四六分明」，在仄起、平起两种格式里取对得更好的。平仄和韵部用 pypinyin 按普通话近似，入声字会判错（这是已知的简化）。
 
 **RLAIF 的评审模型**：Qwen3.8-27B（Apache-2.0），按中文评分细则（`docs/rlaif-rubric.md`：通用、写作、古文、诗词四个领域）打 1–10 分，不开思考模式。显卡上用 vLLM 跑 FP8 版，Mac 上用 `mlx_lm.server` 跑 4-bit 版（一次只算一个请求，要加 `--judge-workers 1`）。`tinybrain judge-check` 用好回答和故意弄坏的回答（截断、答非所问、车轱辘话、诗的字序打乱）检查评审分不分得清好坏。
 

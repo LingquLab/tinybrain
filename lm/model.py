@@ -15,7 +15,7 @@ from .layers.hyper import HyperConnections
 from .layers.norm import RMSNorm
 from .layers.rotary import rotary_tables
 from .layers.streams import StreamEntry, StreamExit
-from .loss import linear_cross_entropy
+from .loss import linear_cross_entropy, stable_cross_entropy
 
 
 class Output(NamedTuple):
@@ -119,7 +119,7 @@ class LanguageModel(nn.Module):
             if logits is None:  # CUDA 上装了 Liger 用融合的输出层加交叉熵，否则分块算；两者结果和一次算完相同
                 loss = linear_cross_entropy(hidden, self.head.weight, targets, chunk=self.loss_chunk) + balance
             else:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1) + balance
+                loss = stable_cross_entropy(logits, targets) + balance
         if state is not None:
             state.pos = pos + T
             if self.memory is not None and self.memory.history_len:
