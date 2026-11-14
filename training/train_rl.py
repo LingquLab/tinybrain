@@ -1,7 +1,6 @@
 """RL：GRPO（带 Dr. GRPO 的修正），奖励可插拔——RLVR、agent RL、RLAIF 都用这一个脚本，区别只在题目文件。
 
-    python -m training.train_rl --init out/small/sft/ckpt.pt --tasks data/rl_small.parquet --out out/small/rl --steps 200 \\
-        --judge-url http://localhost:8000/v1
+    python -m training.train_rl --steps 200 --judge-url http://localhost:8000/v1    # 默认：从 out/small/sft 出发，data/rl_small.parquet，写到 out/small/rl
 
 每一步：
   1. 抽 prompts_per_step 道题，每道采 group_size 个回答（agent 题按多轮跑工具）；
@@ -47,8 +46,8 @@ from .rewards import poetry as poetry_reward
 from .rewards import tools as tool_reward
 from .rewards.tools import ToolEnv
 from .rollout import Episode, collate, keep_fitting, run_agent, sample_group, token_logprobs
-from .trainer_utils import (add_optimizer_args, autocast, load_model, optimizers_from_args, pick_device, save_checkpoint, set_lr_scale,
-                            setup_device, step_optimizers)
+from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, find_stage, format_eta, load_model, optimizers_from_args, pick_device,
+                            save_checkpoint, set_lr_scale, setup_device, step_optimizers)
 
 # 程序判分的题：奖励函数 reward(episode, task) -> 0 到 1
 PROGRAM_REWARDS = {"math": math_reward.reward, "code": code_reward.reward, "agent": tool_reward.reward, "choice": choice_reward.reward,
@@ -140,7 +139,7 @@ def train(cfg, judge=None) -> dict:
     gen = torch.Generator(device="cpu").manual_seed(cfg.seed) if device.type == "cpu" else None
     top_k = cfg.top_k or None
     print(f"设备 {device}；策略模型 {cfg.init}；{len(tasks)} 道题；每步 {cfg.prompts_per_step} 道 × {cfg.group_size} 个回答，共 {cfg.steps} 步", flush=True)
-    stats = {}
+    stats, started = {}, time.perf_counter()
     with open(out / "log.jsonl", "a", encoding="utf-8") as log:
         for step in range(cfg.steps):
             t0 = time.perf_counter()
@@ -171,6 +170,7 @@ def train(cfg, judge=None) -> dict:
                 loss = policy_loss(model, episodes, advs, norm=n_total * cfg.max_new, micro_batch=cfg.micro_batch, device=device)
                 if not math.isfinite(loss):
                     raise RuntimeError(f"第 {step} 步的损失变成了 {loss}")
+                grad_norm = clip_gradients(model.parameters(), cfg.clip_grad)
                 step_optimizers(optimizers)
             flat = [r for rs in rewards for r in rs]
             by_kind = {}
@@ -187,8 +187,9 @@ def train(cfg, judge=None) -> dict:
             log.flush()
             if (step + 1) % cfg.log_every == 0 or step + 1 == cfg.steps:
                 kinds = "，".join(f"{k} {v:+.3f}" for k, v in stats["by_kind"].items())
+                eta = format_eta((cfg.steps - step - 1) * (time.perf_counter() - started) / (step + 1))
                 print(f"第 {step + 1:>5} 步  平均奖励 {stats['reward']:+.4f}（{kinds}）  回答平均 {stats['response_tokens']} 词  "
-                      f"写完的 {stats['finished']:.0%}  采样 {stats['rollout_s']}s / 共 {stats['step_s']}s", flush=True)
+                      f"写完的 {stats['finished']:.0%}  采样 {stats['rollout_s']}s / 共 {stats['step_s']}s  剩余 {eta}", flush=True)
             if (step + 1) % cfg.save_every == 0 or step + 1 == cfg.steps:
                 save_checkpoint(out / "ckpt.pt", model, optimizers, step + 1, rl_config=vars(cfg))
     return stats
@@ -197,9 +198,10 @@ def train(cfg, judge=None) -> dict:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="GRPO：RLVR、agent RL、RLAIF")
     g = p.add_argument_group("模型、题目和输出")
-    g.add_argument("--init", required=True, help="策略模型从这个存档出发（SFT 之后的）")
-    g.add_argument("--tasks", required=True, help="题目数据（parquet），格式见文件开头")
-    g.add_argument("--out", required=True, help="输出目录")
+    g.add_argument("--run", default="out/small", help="运行目录，各个阶段都放在这里")
+    g.add_argument("--init", default=None, help="策略模型从这个存档出发；默认 <运行目录>/sft/ckpt.pt")
+    g.add_argument("--tasks", default="data/rl_small.parquet", help="题目数据（parquet），格式见文件开头")
+    g.add_argument("--out", default=None, help="输出目录；默认 <运行目录>/rl")
 
     g = p.add_argument_group("采样")
     g.add_argument("--steps", type=int, default=100)
@@ -227,7 +229,10 @@ def parse_args(argv=None):
     g.add_argument("--log-every", type=int, default=1)
     g.add_argument("--save-every", type=int, default=50)
     g.add_argument("--device", default="auto")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    args.init = args.init or str(find_stage(args.run, ("sft",)))
+    args.out = args.out or str(Path(args.run) / "rl")
+    return args
 
 
 def main(argv=None):

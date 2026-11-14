@@ -208,6 +208,27 @@ def prepare(inputs: list[str], out: str, tokenizer: str | None = None, val_every
     return {"docs": n_docs, "train": writers["train"].total, "val": writers["val"].total}
 
 
+def ensure_tokens(path: str, chat: bool = False, seq_len: int = 2048, tokenizer: str | None = None) -> str:
+    """训练脚本的 --data 可以直接给 parquet：第一次用时切好，放在它旁边的 tokens/ 目录里（对话数据的目录名带上片段长度），
+    以后直接用切好的。给的本来就是切好的目录，原样返回。meta.json 最后才写，切到一半中断了，下次会重切。"""
+    p = Path(path)
+    if p.suffix != ".parquet":
+        return path
+    if not p.exists():
+        raise FileNotFoundError(f"没有找到 {path}。数据集在 https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset ，"
+                                f"下载后用 --data 指过去；也可以用 python -m dataset.build 自己做")
+    out = p.parent / "tokens" / (f"{p.stem}-{seq_len}" if chat else p.stem)
+    if (out / "meta.json").exists():
+        print(f"用已经切好的 {out}", flush=True)
+        return str(out)
+    print(f"第一次用 {p.name}，先切词到 {out}（只做一次）", flush=True)
+    if chat:
+        prepare_chat([str(p)], str(out), seq_len, tokenizer)
+    else:
+        prepare([str(p)], str(out), tokenizer)
+    return str(out)
+
+
 def prepare_chat(inputs: list[str], out: str, seq_len: int, tokenizer: str | None = None, val_every: int = 1000,
                  train_on: str = "assistant", chunk: int = 20_000) -> dict:
     """对话数据：编码、按 seq_len + 1 打包，写出 train/val 的 .ids.bin 和 .mask.bin。返回各部分的统计。"""

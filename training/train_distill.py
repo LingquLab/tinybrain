@@ -1,7 +1,7 @@
 """MOPD（多老师在线蒸馏）：学生自己生成回答，按每道题的领域找对应的专家当老师，在学生写的每个位置上最小化 KL(学生 ‖ 老师)。
 
-    python -m training.train_distill --init out/medium/sft/ckpt.pt --prompts data/mopd_medium.parquet --out out/medium/mopd \\
-        --teachers 代码=out/medium/expert-code/ckpt.pt 数学=out/medium/expert-math/ckpt.pt 文学=out/medium/expert-lit/ckpt.pt
+    python -m training.train_distill        # 默认：学生是 out/small/sft，老师是 out/small 里所有的 expert_<领域>，data/mopd_prompts.parquet，写到 out/small/mopd
+    python -m training.train_distill --run out/medium --teachers 代码=out/medium/expert_code/ckpt.pt 数学=out/medium/expert_math/ckpt.pt
 
 专家和学生用同一个分词器，所以 KL 是在整个词表上精确算的，不是只靠采样出的那一个词去估。只有一个老师时就是普通的在线蒸馏。
 --merge-init：先把学生换成「SFT 模型 + 各专家相对它的改动的平均」（任务算术，CA-MOPD 的做法），再开始蒸馏。
@@ -25,11 +25,12 @@ from inference.template import ChatFormat
 from inference.tokenizer import DEFAULT_MODEL, Tokenizer
 
 from .rollout import collate, keep_fitting, sample_group
-from .trainer_utils import (add_optimizer_args, autocast, load_model, optimizers_from_args, pick_device, save_checkpoint, set_lr_scale,
-                            setup_device, step_optimizers)
+from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, find_stage, format_eta, load_model, optimizers_from_args, pick_device,
+                            save_checkpoint, set_lr_scale, setup_device, step_optimizers)
 
 
 # 没有单独专家的领域交给哪位老师
+EXPERT_DOMAINS = {"math": "数学", "code": "代码", "literature": "文学"}  # 运行目录里 expert_<名字> 是哪个领域的老师（和 dataset/sft.py 的 EXPERTS 对应）
 ROUTES = {"逻辑": "数学", "阅读": "文学", "诗词": "文学", "写作": "文学", "古文": "文学", "指令跟随": "通用", "科学": "通用", "工具调用": "通用"}
 
 
@@ -92,7 +93,7 @@ def train(cfg) -> dict:
     for p in prompts:
         counts[p["teacher"]] = counts.get(p["teacher"], 0) + 1
     print(f"设备 {device}；学生 {cfg.init}；{len(prompts)} 道提示，交给各位老师：" + "，".join(f"{t} {n}" for t, n in counts.items()) + f"；共 {cfg.steps} 步", flush=True)
-    stats = {}
+    stats, started = {}, time.perf_counter()
     with open(out / "log.jsonl", "a", encoding="utf-8") as log:
         for step in range(cfg.steps):
             t0 = time.perf_counter()
@@ -121,12 +122,15 @@ def train(cfg) -> dict:
                 per_domain[domain] = round(kl_sum / max(1, sum(sum(e.learn) for e in episodes)), 4)
             if not math.isfinite(total):
                 raise RuntimeError(f"第 {step} 步的 KL 变成了 {total}")
+            clip_gradients(student.parameters(), cfg.clip_grad)
             step_optimizers(optimizers)
             stats = dict(step=step + 1, kl=round(total / max(1, n_tokens), 4), by_domain=per_domain, response_tokens=n_tokens, step_s=round(time.perf_counter() - t0, 1))
             log.write(json.dumps(stats, ensure_ascii=False) + "\n")
             log.flush()
             if (step + 1) % cfg.log_every == 0 or step + 1 == cfg.steps:
-                print(f"第 {step + 1:>5} 步  KL {stats['kl']:.4f}（" + "，".join(f"{d} {v:.3f}" for d, v in per_domain.items()) + f"）  {stats['step_s']}s", flush=True)
+                eta = format_eta((cfg.steps - step - 1) * (time.perf_counter() - started) / (step + 1))
+                print(f"第 {step + 1:>5} 步  KL {stats['kl']:.4f}（" + "，".join(f"{d} {v:.3f}" for d, v in per_domain.items()) +
+                      f"）  {stats['step_s']}s  剩余 {eta}", flush=True)
             if (step + 1) % cfg.save_every == 0 or step + 1 == cfg.steps:
                 save_checkpoint(out / "ckpt.pt", student, optimizers, step + 1, distill_config=vars(cfg))
     return stats
@@ -142,6 +146,16 @@ def parse_routes(pairs: list[str]) -> dict:
     return out
 
 
+def find_teachers(run) -> list[str]:
+    """运行目录里的专家存档（expert_<名字>/ckpt.pt），写成 领域=存档。"""
+    pairs = [f"{domain}={Path(run) / f'expert_{name}' / 'ckpt.pt'}" for name, domain in EXPERT_DOMAINS.items()
+             if (Path(run) / f"expert_{name}" / "ckpt.pt").exists()]
+    if not pairs:
+        raise FileNotFoundError(f"在 {run} 下没找到专家的存档（expert_math、expert_code、expert_literature）："
+                                f"先用 python -m training.train_sft --data data/sft_expert_math.parquet 这样训出专家，或者用 --teachers 指定")
+    return pairs
+
+
 def parse_teachers(pairs: list[str]) -> dict:
     out = {}
     for pair in pairs:
@@ -155,10 +169,12 @@ def parse_teachers(pairs: list[str]) -> dict:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="MOPD：多老师在线蒸馏")
     g = p.add_argument_group("模型、提示和输出")
-    g.add_argument("--init", required=True, help="学生从这个存档出发（通用 SFT 模型）")
-    g.add_argument("--prompts", required=True, help="提示数据（parquet），每行有 messages 和 domain")
-    g.add_argument("--out", required=True, help="输出目录")
-    g.add_argument("--teachers", nargs="+", required=True, metavar="领域=存档", help="每个领域的老师，比如 数学=out/medium/expert_math/ckpt.pt")
+    g.add_argument("--run", default="out/small", help="运行目录，各个阶段都放在这里")
+    g.add_argument("--init", default=None, help="学生从这个存档出发（通用 SFT 模型）；默认 <运行目录>/sft/ckpt.pt")
+    g.add_argument("--prompts", default="data/mopd_prompts.parquet", help="提示数据（parquet），每行有 messages 和 domain")
+    g.add_argument("--out", default=None, help="输出目录；默认 <运行目录>/mopd")
+    g.add_argument("--teachers", nargs="+", default=None, metavar="领域=存档",
+                   help="每个领域的老师，比如 数学=out/small/expert_math/ckpt.pt；默认是运行目录里所有的 expert_<领域>")
     g.add_argument("--route", nargs="*", default=[], metavar="领域=老师", help="没有同名老师的领域交给谁，在默认路由表（ROUTES）上改或加")
     g.add_argument("--merge-init", action="store_true", help="先把学生换成 SFT 模型 + 各专家改动的平均（任务算术），再开始蒸馏")
 
@@ -180,7 +196,9 @@ def parse_args(argv=None):
     g.add_argument("--save-every", type=int, default=50)
     g.add_argument("--device", default="auto")
     args = p.parse_args(argv)
-    args.teachers = parse_teachers(args.teachers)
+    args.init = args.init or str(find_stage(args.run, ("sft",)))
+    args.out = args.out or str(Path(args.run) / "mopd")
+    args.teachers = parse_teachers(args.teachers or find_teachers(args.run))
     args.routes = parse_routes(args.route)
     return args
 

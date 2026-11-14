@@ -1,10 +1,13 @@
 """预训练，也用来退火。
 
-    python -m training.train_pretrain --data data/tokens/nano --out out/small/pretrain --preset small --seq-len 4096 --batch-size 8 --epochs 1
+    python -m training.train_pretrain                                   # 默认：small，data/pretrain_nano.parquet，写到 out/small/pretrain
+    python -m training.train_pretrain --data data/pretrain_mini.parquet --seq-len 2048 --batch-size 16
 
-    # 退火：从预训练的存档出发，九成预训练数据 + 一成对话数据（整段算损失），学习率从 0.1 倍降到 0
-    python -m training.train_pretrain --init out/small/pretrain/ckpt.pt --data data/tokens/nano:0.9,data/tokens/chat-all:0.1 \\
-        --out out/small/anneal --steps 2000 --warmup-steps 0 --lr-mult 0.1 --final-lr-frac 0
+    # 退火：从预训练的存档出发，九成预训练数据 + 一成对话数据（整段算损失），学习率从 0.1 倍降到 0；给了 --init 默认写到 out/small/anneal
+    python -m training.train_pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_nano.parquet:0.9,data/tokens/chat-all:0.1 \\
+        --steps 2000 --warmup-steps 0 --lr-mult 0.1 --final-lr-frac 0
+
+--data 可以直接给 parquet，第一次用时自动切词，放在它旁边的 tokens/ 目录里（见 tools.prepare.ensure_tokens）；也可以给切好的目录。
 
 按轮数训（--epochs，默认 1）：数据切成不重叠的片段，每轮打乱一次依次取完，一轮里每个片段恰好看一遍；也可以直接给 --steps。
 日志里每一行都写着已经训了多少词（tokens）、多少轮（epoch），不用自己乘。
@@ -24,8 +27,8 @@ import torch
 from lm import PRESETS, LanguageModel, ModelConfig, preset
 
 from .dataset import open_mixed
-from .trainer_utils import (add_optimizer_args, autocast, compile_model, count, load_checkpoint, lr_scale, optimizers_from_args, pick_device, resume,
-                            save_checkpoint, set_lr_scale, setup_device, step_optimizers)
+from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, compile_model, count, format_eta, load_checkpoint, lr_scale, optimizers_from_args,
+                            pick_device, resume, save_checkpoint, set_lr_scale, setup_device, step_optimizers)
 
 MODEL_ARGS = ("dim", "n_layers", "n_heads", "n_kv_heads", "max_seq_len", "window", "moe_experts")  # 命令行上能直接改的模型设置
 
@@ -86,8 +89,22 @@ def total_steps(args, windows: int) -> int:
     return max(1, math.ceil(args.epochs * windows / (args.batch_size * args.grad_accum)))
 
 
+def tokens_for(spec: str) -> str:
+    """把 --data 里的每个 parquet 换成切好的目录（第一次用时切），权重原样保留：「a.parquet:0.9,b:0.1」→「data/tokens/a:0.9,b:0.1」。"""
+    from tools.prepare import ensure_tokens
+
+    parts = []
+    for item in spec.split(","):
+        path, sep, weight = item.rpartition(":")
+        if not sep or not weight.replace(".", "", 1).isdigit():
+            path, weight = item, ""
+        parts.append(ensure_tokens(path) + (f":{weight}" if weight else ""))
+    return ",".join(parts)
+
+
 def train(args) -> dict:
     """跑完训练，返回 {"step", "loss", "val_loss", "tokens"}。"""
+    args.data = tokens_for(args.data)
     device = pick_device(args.device)
     setup_device(device)
     torch.manual_seed(args.seed)
@@ -141,6 +158,7 @@ def train(args) -> dict:
                 loss_value += loss.item()
             if not math.isfinite(loss_value):
                 raise RuntimeError(f"第 {step} 步的损失变成了 {loss_value}，训练停下。上一个存档在 {out / 'ckpt.pt'}")
+            grad_norm = clip_gradients(model.parameters(), args.clip_grad)
             if graph_step is None:
                 step_optimizers(optimizers)
             else:
@@ -157,8 +175,12 @@ def train(args) -> dict:
                 epoch = done * rows_per_step / windows
                 record = dict(step=done, tokens=done * tokens_per_step, epoch=round(epoch, 4), loss=round(loss_value, 4), smooth_loss=round(smooth, 4),
                               lr_scale=round(scale, 4), tokens_per_s=round(speed))
+                if grad_norm is not None:
+                    record["grad_norm"] = round(float(grad_norm), 4)
+                eta = format_eta((steps - done) * tokens_per_step / max(speed, 1e-9))
                 print(f"第 {done:>7} 步（{epoch:.3f} 轮，{count(done * tokens_per_step)} 词）  损失 {loss_value:.4f}（平滑 {smooth:.4f}）  "
-                      f"学习率×{scale:.3f}  每秒 {speed:,.0f} 词", flush=True)
+                      f"学习率×{scale:.3f}" + (f"  梯度 {float(grad_norm):.2f}" if grad_norm is not None else "") +
+                      f"  每秒 {speed:,.0f} 词  剩余 {eta}", flush=True)
             if val_data and (done % args.eval_every == 0 or done == steps):
                 val_loss = evaluate(forward, val_data, args, device)
                 record = {**(record or dict(step=done)), "val_loss": round(val_loss, 4)}
@@ -175,8 +197,10 @@ def train(args) -> dict:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="预训练（也用来退火）")
     g = p.add_argument_group("数据和输出")
-    g.add_argument("--data", required=True, help="准备好的词数据目录（tools.prepare 写的）；可以写成「目录A:0.9,目录B:0.1」按比例混合")
-    g.add_argument("--out", required=True, help="输出目录")
+    g.add_argument("--data", default="data/pretrain_nano.parquet",
+                   help="parquet（第一次用时自动切词）或切好的目录；可以写成「A:0.9,B:0.1」按比例混合")
+    g.add_argument("--run", default=None, help="运行目录，各个阶段都放在这里；默认 out/<预设名>")
+    g.add_argument("--out", default=None, help="输出目录；默认 <运行目录>/pretrain，给了 --init 时是 <运行目录>/anneal")
     g.add_argument("--seq-len", type=int, default=2048, help="每个片段多少个词")
     g.add_argument("--batch-size", type=int, default=8, help="每个批次多少个片段")
 
@@ -213,7 +237,10 @@ def parse_args(argv=None):
     g.add_argument("--no-compile", action="store_true", help="CUDA 上也不用 torch.compile")
     g.add_argument("--cuda-graph", action="store_true", help="捕获融合 Adam 和 Muon 更新图；只支持 CUDA 普通前馈模型、自定义 Muon")
     g.add_argument("--autotune", action="store_true", help="为固定形状搜索更快的矩阵和注意力内核；首次启动编译更久")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    args.run = args.run or f"out/{args.preset}"
+    args.out = args.out or str(Path(args.run) / ("anneal" if args.init else "pretrain"))
+    return args
 
 
 def main(argv=None):

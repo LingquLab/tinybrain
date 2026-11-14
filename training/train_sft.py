@@ -1,11 +1,14 @@
 """SFT：从一个存档出发，在打包好的对话数据上接着训，只在回答上算损失。三档的通用 SFT 和三个领域专家都用它。
 
-    python -m tools.prepare --chat --input data/sft_small.parquet --out data/tokens/sft-small --seq-len 2048
-    python -m training.train_sft --init out/small/anneal/ckpt.pt --data data/tokens/sft-small --out out/small/sft --epochs 2
-    python -m training.train_sft --init out/medium/sft/ckpt.pt --data data/tokens/expert-math --out out/medium/expert_math --epochs 1   # 领域专家
+    python -m training.train_sft                                        # 默认：data/sft_small.parquet，从 out/small 里的退火（没有就预训练）出发
+    python -m training.train_sft --data data/sft_expert_math.parquet    # 领域专家：从同一个起点出发，写到 out/small/expert_math
+    python -m training.train_sft --run out/medium --init out/medium/sft/ckpt.pt --data data/sft_expert_code.parquet
+
+--data 可以直接给 parquet，第一次用时按 --seq-len 打包，放在它旁边的 tokens/ 目录里；也可以给 tools.prepare --chat 打包好的目录。
+不写 --out 时：数据叫 sft_expert_<领域> 就写到 <运行目录>/expert_<领域>，否则写到 <运行目录>/sft。
 
 和预训练不同的地方：
-  - 一定要 --init，模型设置取自存档；
+  - 模型设置取自出发的存档（--init，不写就在运行目录里找退火或预训练的存档）；
   - 数据是 tools.prepare --chat 打包的对话，一行一个片段，片段长度就是打包时的 --seq-len；遮罩为 0 的位置（提示、填充）不算损失；
   - 按轮数（--epochs）或步数（--steps）训；
   - 学习率默认是预训练的 0.1 倍、预热短、最后降到 0（还没在我们的模型上调过）。
@@ -20,8 +23,8 @@ from pathlib import Path
 import torch
 
 from .dataset import PackedData, open_data
-from .trainer_utils import (add_optimizer_args, autocast, compile_model, count, load_model, lr_scale, optimizers_from_args, pick_device, resume,
-                            save_checkpoint, set_lr_scale, setup_device, step_optimizers)
+from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, compile_model, count, find_stage, format_eta, load_model, lr_scale,
+                            optimizers_from_args, pick_device, resume, save_checkpoint, set_lr_scale, setup_device, step_optimizers)
 
 
 def open_chat_data(directory: str) -> tuple[PackedData, PackedData]:
@@ -57,6 +60,7 @@ def evaluate(model, data: PackedData, args, device: torch.device) -> float:
 
 def train(args) -> dict:
     """跑完 SFT，返回 {"step", "loss", "val_loss", "tokens"}。tokens 只算回答部分的词。"""
+    resolve_init(args)
     device = pick_device(args.device)
     setup_device(device)
     torch.manual_seed(args.seed)
@@ -64,6 +68,9 @@ def train(args) -> dict:
     out.mkdir(parents=True, exist_ok=True)
 
     # 数据
+    from tools.prepare import ensure_tokens
+
+    args.data = ensure_tokens(args.data, chat=True, seq_len=args.seq_len)
     train_data, val_data = open_chat_data(args.data)
     seq_len = train_data.row_len - 1
     steps = total_steps(args, train_data)
@@ -87,7 +94,7 @@ def train(args) -> dict:
     # 训练循环
     model.train()
     smooth, val_loss, loss_value, learned = None, None, float("nan"), 0
-    last_time = time.perf_counter()
+    last_time, last_step = time.perf_counter(), start_step
     with open(out / "log.jsonl", "a", encoding="utf-8") as log:
         for step in range(start_step, steps):
             scale = lr_scale(step, steps, args.warmup_steps, args.final_lr_frac)
@@ -102,6 +109,7 @@ def train(args) -> dict:
                 loss_value += loss.item()
             if not math.isfinite(loss_value):
                 raise RuntimeError(f"第 {step} 步的损失变成了 {loss_value}，训练停下。上一个存档在 {out / 'ckpt.pt'}")
+            grad_norm = clip_gradients(model.parameters(), args.clip_grad)
             step_optimizers(optimizers)
             smooth = loss_value if smooth is None else 0.9 * smooth + 0.1 * loss_value
 
@@ -113,12 +121,17 @@ def train(args) -> dict:
                 epoch = done * args.batch_size * args.grad_accum / train_data.rows
                 record = dict(step=done, epoch=round(epoch, 4), answer_tokens=learned, loss=round(loss_value, 4), smooth_loss=round(smooth, 4),
                               lr_scale=round(scale, 4), seconds=round(now - last_time, 2))
-                last_time = now
-                print(f"第 {done:>6} 步（{epoch:.3f} 轮，回答 {count(learned)} 词）  损失 {loss_value:.4f}（平滑 {smooth:.4f}）  学习率×{scale:.3f}", flush=True)
+                if grad_norm is not None:
+                    record["grad_norm"] = round(float(grad_norm), 4)
+                eta = format_eta((steps - done) * (now - last_time) / max(1, done - last_step))
+                last_time, last_step = now, done
+                print(f"第 {done:>6} 步（{epoch:.3f} 轮，回答 {count(learned)} 词）  损失 {loss_value:.4f}（平滑 {smooth:.4f}）  学习率×{scale:.3f}"
+                      + (f"  梯度 {float(grad_norm):.2f}" if grad_norm is not None else "") + f"  剩余 {eta}", flush=True)
             if val_data and (done % args.eval_every == 0 or done == steps):
                 val_loss = evaluate(forward, val_data, args, device)
                 record = {**(record or dict(step=done)), "val_loss": round(val_loss, 4)}
                 print(f"第 {done:>6} 步  验证集损失 {val_loss:.4f}", flush=True)
+                last_time = time.perf_counter()  # 验证花的时间不算进剩余时间
             if record:
                 log.write(json.dumps(record) + "\n")
                 log.flush()
@@ -130,9 +143,11 @@ def train(args) -> dict:
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="SFT：只在回答上算损失")
     g = p.add_argument_group("数据和输出")
-    g.add_argument("--init", required=True, help="从这个存档出发（退火之后的，或者通用 SFT 之后的）")
-    g.add_argument("--data", required=True, help="tools.prepare --chat 打包好的对话数据目录")
-    g.add_argument("--out", required=True, help="输出目录")
+    g.add_argument("--run", default="out/small", help="运行目录，各个阶段都放在这里")
+    g.add_argument("--init", default=None, help="从这个存档出发；默认是运行目录里的退火存档，没有就用预训练的")
+    g.add_argument("--data", default="data/sft_small.parquet", help="对话数据：parquet（第一次用时自动打包）或 tools.prepare --chat 打包好的目录")
+    g.add_argument("--seq-len", type=int, default=2048, help="--data 是 parquet 时，打包成多长的片段")
+    g.add_argument("--out", default=None, help="输出目录；默认 <运行目录>/sft，专家数据（sft_expert_<领域>）是 <运行目录>/expert_<领域>")
     g.add_argument("--batch-size", type=int, default=16, help="每个批次多少行")
 
     g = p.add_argument_group("训练")
@@ -154,7 +169,17 @@ def parse_args(argv=None):
     g = p.add_argument_group("硬件")
     g.add_argument("--device", default="auto")
     g.add_argument("--no-compile", action="store_true")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.out is None:
+        name = Path(args.data).stem.split("-")[0]
+        args.out = str(Path(args.run) / (name.removeprefix("sft_") if name.startswith("sft_expert_") else "sft"))
+    return args
+
+
+def resolve_init(args) -> None:
+    """没写 --init 时，在运行目录里找出发的存档（退火优先，其次预训练）。放在训练开始时做，只看参数的地方不用存档存在。"""
+    if not args.init:
+        args.init = str(find_stage(args.run, ("anneal", "pretrain")))
 
 
 def main(argv=None):

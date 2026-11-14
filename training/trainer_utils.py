@@ -1,4 +1,4 @@
-"""各个训练脚本（train_*.py）共用的东西：设备和混合精度、学习率曲线、优化器、存档。
+"""各个训练脚本（train_*.py）共用的东西：设备和混合精度、学习率曲线、优化器、存档、运行目录。
 
 每个阶段自己的流程（读什么数据、损失怎么算、循环怎么走）都写在它自己的脚本里，这里只放大家都一样的部分。
 """
@@ -67,6 +67,20 @@ def compile_model(model: torch.nn.Module, device: torch.device, enabled: bool = 
 
 def peak_memory_gb(device: torch.device) -> float | None:
     return torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None
+
+
+def format_eta(seconds: float) -> str:
+    """剩余时间写成人话：45 秒、2 分、3 小时 25 分、2 天 5 小时。算不出来时是「—」。"""
+    if not math.isfinite(seconds) or seconds < 0:
+        return "—"
+    s = int(seconds)
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        return f"{s // 60} 分"
+    if s < 86400:
+        return f"{s // 3600} 小时 {s % 3600 // 60} 分"
+    return f"{s // 86400} 天 {s % 86400 // 3600} 小时"
 
 
 def count(n: float) -> str:
@@ -159,6 +173,7 @@ def add_optimizer_args(parser, lr_mult: float = 1.0) -> None:
     g.add_argument("--engram-lr", type=float, default=0.3, help="Engram 记忆表（不做权重衰减）")
     g.add_argument("--scalar-lr", type=float, default=0.01, help="归一化系数、多流残差系数、流入口出口的查询向量")
     g.add_argument("--weight-decay", type=float, default=0.0, help="只作用在 Muon 管的矩阵上")
+    g.add_argument("--clip-grad", type=float, default=1.0, help="梯度裁剪：所有梯度合起来的范数超过它就按比例缩小；0 表示不裁剪")
 
 
 def optimizers_from_args(model: LanguageModel, args) -> list[torch.optim.Optimizer]:
@@ -166,10 +181,35 @@ def optimizers_from_args(model: LanguageModel, args) -> list[torch.optim.Optimiz
                             engram_lr=args.engram_lr, scalar_lr=args.scalar_lr, weight_decay=args.weight_decay)
 
 
+def clip_gradients(params, max_norm: float) -> torch.Tensor | None:
+    """把梯度的总范数裁到 max_norm 以内，返回裁剪前的总范数（记进日志）；max_norm 为 0 时不裁、返回 None。"""
+    if not max_norm:
+        return None
+    return torch.nn.utils.clip_grad_norm_(list(params), max_norm, foreach=True)
+
+
 def step_optimizers(optimizers: list[torch.optim.Optimizer]) -> None:
     for opt in optimizers:
         opt.step()
         opt.zero_grad(set_to_none=True)
+
+
+# ---------- 运行目录：一次完整训练的各个阶段都放在同一个目录下（默认 out/small），每个阶段写到 <运行目录>/<阶段>/ckpt.pt，
+# 下一个阶段不写 --init 时，就从这里找上一个阶段的存档。
+
+STAGE_COMMANDS = {"pretrain": "python -m training.train_pretrain", "anneal": "python -m training.train_pretrain --init <预训练的存档>",
+                  "sft": "python -m training.train_sft", "mopd": "python -m training.train_distill", "rl": "python -m training.train_rl"}
+
+
+def find_stage(run, stages: tuple) -> Path:
+    """按顺序找 <run>/<阶段>/ckpt.pt，返回第一个存在的；都没有就报错，说明该先跑哪一步。"""
+    for stage in stages:
+        path = Path(run) / stage / "ckpt.pt"
+        if path.exists():
+            return path
+    tried = "、".join(f"{stage}/ckpt.pt" for stage in stages)
+    hint = STAGE_COMMANDS.get(stages[-1], f"{stages[-1]} 这个阶段")
+    raise FileNotFoundError(f"在 {run} 下没找到 {tried}：先跑 {hint}，或者用 --init 指定存档（--run 可以换运行目录）")
 
 
 # ---------- 存档：模型参数、优化器状态、走到第几步、模型配置。先写临时文件再改名，中途断电不会留下半个存档。
