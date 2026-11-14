@@ -137,6 +137,8 @@ def normalize(messages: list[dict], keep_reasoning: bool) -> list[dict] | None:
                 return None
             reasoning = to_simplified(m.get("reasoning") or "").strip()
             if reasoning and keep_reasoning:
+                if _OTHER_MODEL.search(reasoning):  # 推理过程会原样留在回答前面，里面的自称也要拦
+                    return None
                 content = f"<think>\n{reasoning}\n</think>\n\n{content}"
             elif not keep_reasoning:
                 content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.S).strip()
