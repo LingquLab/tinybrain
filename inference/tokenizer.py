@@ -6,6 +6,8 @@ import sentencepiece as spm
 ROOT = Path(__file__).resolve().parents[1]
 # 正式用的分词器（2026-11-12 定）：SentencePiece BPE，32768 词，字符覆盖率 0.99995
 DEFAULT_MODEL = ROOT / "tokenizer" / "tokenizer.model"
+# 同一个分词器的 HF 格式（python -m tools.tokenizer export-hf 从 .model 导出，逐词一致），给 gigatoken 这类快速实现用
+DEFAULT_JSON = DEFAULT_MODEL.with_suffix(".json")
 VOCAB_SIZE = 32768
 UNK, BOS, EOS, PAD = 0, 1, 2, 3
 CONTROL = ["<|im_start|>", "<|im_end|>"] + [f"<|reserved_{i}|>" for i in range(6)]

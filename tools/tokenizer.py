@@ -3,6 +3,7 @@
     python -m tools.tokenizer sample --tokens 40000000        # 抽样本 → out/tokenizer/corpus.txt、heldout.jsonl
     python -m tools.tokenizer train --vocab 32768              # 训练 → out/tokenizer/sp32768.model
     python -m tools.tokenizer eval out/tokenizer/sp32768.model # 各类文本上一个词平均几个字
+    python -m tools.tokenizer export-hf tokenizer/tokenizer.model  # 导出逐词一致的 HF 格式 → tokenizer/tokenizer.json
 
 样本直接从原始文件现洗（和 dataset/pretrain.py 同一套清洗），所以还没整批洗完的来源也能用。
 每个来源只读少数几个分片（默认 3 个，在文件列表里均匀地取，大来源的不同子来源都能碰到），每个分片读开头的一部分。
@@ -148,6 +149,26 @@ def strip_paths(model_path: Path) -> None:
     Path(model_path).write_bytes(m.SerializeToString())
 
 
+def export_hf(model_path: Path, out: Path | None = None) -> Path:
+    """导出一个和 .model 逐词一致的 HF 格式分词器（默认写到同名 .json），tools.prepare 用它交给 gigatoken 编码，快一个数量级。
+
+    做法和 Llama 2 的官方转换一样：空格换成 ▁，BPE 按「合并结果在词表里的编号」排合并顺序（SentencePiece 按分数挑，
+    分数和编号同序），字节兜底。不需要预分词：训练时已经按空白、文字种类和数字切过，词表里没有跨这些边界的词。
+    控制符、未知词和字节词不当作合并的结果：SentencePiece 从来不会从正文里拼出它们。要装 tokenizers。"""
+    from tokenizers import Tokenizer as HFTokenizer, models, normalizers
+
+    sp = Tokenizer(model_path).sp
+    vocab = {sp.id_to_piece(i): i for i in range(sp.get_piece_size())}
+    special = {i for i in range(sp.get_piece_size()) if sp.is_control(i) or sp.is_unknown(i) or sp.is_byte(i)}
+    merges = sorted(((i, k), (piece[:k], piece[k:])) for piece, i in vocab.items() if i not in special
+                    for k in range(1, len(piece)) if piece[:k] in vocab and piece[k:] in vocab)
+    hf = HFTokenizer(models.BPE(vocab=vocab, merges=[m for _, m in merges], byte_fallback=True, unk_token=sp.id_to_piece(UNK), fuse_unk=True))
+    hf.normalizer = normalizers.Replace(" ", "▁")
+    out = Path(out) if out else Path(model_path).with_suffix(".json")
+    hf.save(str(out))
+    return out
+
+
 def evaluate(model_path: Path, heldout: Path = OUT / "heldout.jsonl") -> dict:
     """在留出来的文档上，按类别量：一个词平均几个字、字节兜底的词占多少、和流水线估算的 token 数差多少；并检查解码是否和原文一样。"""
     tok = Tokenizer(model_path)
@@ -192,7 +213,12 @@ def main(argv=None):
     p = sub.add_parser("eval")
     p.add_argument("models", nargs="+")
     p.add_argument("--heldout", default=str(OUT / "heldout.jsonl"))
+    p = sub.add_parser("export-hf", help="导出逐词一致的 HF 格式（同名 .json）")
+    p.add_argument("model", nargs="?", default=str(DEFAULT_MODEL))
     args = parser.parse_args(argv)
+    if args.command == "export-hf":
+        print("写到了", export_hf(Path(args.model)))
+        return
     if args.command == "sample":
         stats = sample_corpus(args.tokens, Path(args.out), args.shards)
         print(f"共抽到 {sum(s['tokens'] for s in stats.values()) / 1e6:.1f}M token、{sum(s['chars'] for s in stats.values()) / 1e6:.1f}M 字，"

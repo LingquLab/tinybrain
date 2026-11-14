@@ -39,6 +39,7 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 ```bash
 git clone https://github.com/cai114514114514/tinybrain && cd tinybrain
 pip install -e ".[data]"          # 要 Python 3.11+、PyTorch 2.5+（用 PyTorch 自带的 Muon 要 2.9+）
+pip install -e ".[fast]"          # 可选：切词改用 gigatoken，快一个数量级，结果一字节不差（Windows 上建议在 WSL 里装）
 ```
 
 **1. 拿到数据**（二选一）

@@ -12,6 +12,7 @@ dependencies = ["torch>=2.5"]
 
 [project.optional-dependencies]
 data = ["numpy", "pyarrow", "OpenCC", "zstandard"]
+fast = ["gigatoken"]  # 切词快一个数量级（tools.prepare 自动使用）；Windows 上建议在 WSL 里装
 
 [tool.setuptools.packages.find]
 include = ["lm*", "training*", "inference*", "eval*", "tools*", "dataset*"]

@@ -2,8 +2,12 @@
 
     python -m tools.prepare --input "data/mix/out/nano/*.parquet" --out data/tokens/nano
 
-编码在 --workers 个进程里并行（默认用满所有核），每个进程单线程跑 SentencePiece，主进程按原来的顺序收回来写盘，
-结果和单进程逐篇编码一字节不差。
+编码有两种引擎，结果一字节不差：
+  gigatoken      装了 gigatoken（pip install gigatoken）、.model 旁边有同名的 .json（HF 格式，python -m tools.tokenizer export-hf
+                 导出，仓库里的正式分词器已经带着）时自动用它。Rust + SIMD，parquet 的列直接交给它，不经过 Python 字符串，
+                 M4 Max 上整个 nano（3.9 GB 文本）不到 10 秒。开始时会拿第一批的前几百篇和 SentencePiece 对一遍。
+  sentencepiece  其余情况：--workers 个进程并行（默认用满所有核），每个进程单线程跑 SentencePiece，主进程按原顺序收回来写盘。
+--engine 可以指定其中一种。
 
 --tokenizer 默认是仓库里的正式分词器 tokenizer/tokenizer.model；也可以换成别的 SentencePiece .model 文件，或者 bytes：
 把 UTF-8 的每个字节当成一个词（0 是文档结束符，字节 b 记作 b+1，词表 257），只用来在没有分词器时跑通流程。
@@ -81,14 +85,65 @@ def _encode_batch(job: tuple) -> dict:
     return out
 
 
+def load_fast_encoder(tokenizer: str, required: bool = False):
+    """gigatoken 编码器：pyarrow 的字符串列 → (每篇的词数, 所有篇的词接在一起)。
+    没装 gigatoken、或 .model 旁边没有同名 .json 时返回 None；required 时改成报错，说明缺什么。"""
+    json_path = Path(tokenizer).with_suffix(".json")
+    try:
+        import awkward as ak
+        import gigatoken as gt
+        import pyarrow as pa
+    except ImportError:
+        if required:
+            raise RuntimeError("要用 gigatoken 引擎得先装：pip install gigatoken") from None
+        return None
+    if not json_path.exists():
+        if required:
+            raise RuntimeError(f"gigatoken 要一个和 {Path(tokenizer).name} 逐词一致的 HF 格式文件 {json_path.name}，"
+                               f"先跑：python -m tools.tokenizer export-hf {tokenizer}")
+        return None
+    fast = gt.Tokenizer.from_json(json_path.read_text(encoding="utf-8"))
+
+    def encode(column):
+        docs = ak.from_arrow(column.cast(pa.large_string()))
+        if isinstance(docs.type.content, ak.types.OptionType):  # 有空值的列：空值当成空文档
+            docs = ak.fill_none(docs, "")
+        ids = fast.encode_batch(docs)
+        return ak.to_numpy(ak.num(ids)).astype(np.int64), ak.to_numpy(ak.flatten(ids))
+    return encode
+
+
+def _split_with_eos(lens: np.ndarray, flat: np.ndarray, first: int, val_every: int, eos: int, dtype: str) -> dict:
+    """一批文档（每篇的词数 + 接在一起的词）→ {"train": 数组, "val": 数组}，每篇后面接结束符。"""
+    index = first + np.arange(lens.size)
+    is_val = (index % val_every == val_every - 1) if val_every else np.zeros(lens.size, dtype=bool)
+    token_is_val = np.repeat(is_val, lens)
+    out = {}
+    for split, docs, tokens in (("train", ~is_val, ~token_is_val), ("val", is_val, token_is_val)):
+        n = lens[docs]
+        arr = np.empty(int(n.sum()) + n.size, dtype=dtype)
+        ends = np.cumsum(n + 1) - 1
+        body = np.ones(arr.size, dtype=bool)
+        body[ends] = False
+        arr[body] = flat[tokens]
+        arr[ends] = eos
+        out[split] = arr
+    return out
+
+
 def prepare(inputs: list[str], out: str, tokenizer: str | None = None, val_every: int = 1000, shard_tokens: int = 100_000_000,
-            workers: int | None = None, batch_docs: int = 1000) -> dict:
+            workers: int | None = None, batch_docs: int | None = None, engine: str = "auto") -> dict:
     """读 parquet 文件的 text 列，每篇后面接一个结束符。每 val_every 篇里拿一篇放进验证集。返回各部分的词数。
-    workers 是编码进程数，默认等于 CPU 核数；1 就在本进程里编。"""
+    engine：auto、gigatoken、sentencepiece（见文件开头）。workers 是 sentencepiece 引擎的进程数，默认等于 CPU 核数；1 就在本进程里编。"""
     from training.dataset import ShardWriter, write_meta
 
     tokenizer = tokenizer or default_tokenizer()
     _, vocab_size, eos, kind = load_encoder(tokenizer)
+    if engine == "gigatoken" and kind != "sentencepiece":
+        raise RuntimeError("gigatoken 引擎只用于 SentencePiece 分词器")
+    fast = load_fast_encoder(tokenizer, required=engine == "gigatoken") if engine != "sentencepiece" and kind == "sentencepiece" else None
+    print(f"编码引擎：{'gigatoken' if fast else kind}", flush=True)
+    batch_docs = batch_docs or (16384 if fast else 1000)
     dtype = "uint16" if vocab_size <= 1 << 16 else "uint32"
     files = sorted(f for pattern in inputs for f in glob.glob(pattern))
     if not files:
@@ -111,7 +166,23 @@ def prepare(inputs: list[str], out: str, tokenizer: str | None = None, val_every
                 writers[split].write(arr)
 
     n_docs = 0
-    if workers == 1:
+    if fast:
+        from inference.tokenizer import Tokenizer
+
+        check = Tokenizer(tokenizer)
+        for path in files:
+            for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_docs, columns=["text"]):
+                column = batch.column("text")
+                lens, flat = fast(column)
+                if n_docs == 0:  # 开始时和 SentencePiece 对一遍，万一不一致就停下，不写出和推理时对不上的数据
+                    k = min(256, lens.size)
+                    expected = check.encode(column.slice(0, k).to_pylist(), num_threads=4)
+                    got = np.split(flat[:int(lens[:k].sum())], np.cumsum(lens[:k])[:-1]) if k else []
+                    if any(list(g) != e for g, e in zip(got, expected)):
+                        raise RuntimeError("gigatoken 和 SentencePiece 的结果不一致，换 --engine sentencepiece，并到 GitHub 报告")
+                write(_split_with_eos(lens, flat, n_docs, val_every, eos, dtype))
+                n_docs += lens.size
+    elif workers == 1:
         _start_worker(tokenizer)
         for job in jobs():
             write(_encode_batch(job))
@@ -191,7 +262,9 @@ def main(argv=None):
     parser.add_argument("--out", required=True)
     parser.add_argument("--tokenizer", default=None, help="SentencePiece 的 .model 文件，或者 bytes；默认是 tokenizer/tokenizer.model")
     parser.add_argument("--val-every", type=int, default=1000, help="每多少篇里拿一篇放进验证集；0 表示不留")
-    parser.add_argument("--workers", type=int, default=None, help="编码用几个进程，默认等于 CPU 核数")
+    parser.add_argument("--engine", choices=["auto", "gigatoken", "sentencepiece"], default="auto",
+                        help="auto：装了 gigatoken 就用它，否则用 SentencePiece；两者结果一字节不差")
+    parser.add_argument("--workers", type=int, default=None, help="sentencepiece 引擎用几个进程，默认等于 CPU 核数")
     parser.add_argument("--chat", action="store_true", help="输入是对话（messages 列），打包成 SFT 用的数据")
     parser.add_argument("--seq-len", type=int, default=2048, help="--chat 时每行的片段长度")
     parser.add_argument("--train-on", choices=["assistant", "all"], default="assistant", help="--chat 时哪些词算损失")
@@ -202,7 +275,7 @@ def main(argv=None):
             print(f"{split}：{st['examples']} 段对话打成 {st['rows']} 行，要学的词 {st['target_tokens'] / 1e6:.2f}M，"
                   f"太长丢掉 {st['dropped_too_long']} 段")
         return
-    stats = prepare(args.input, args.out, args.tokenizer, args.val_every, workers=args.workers)
+    stats = prepare(args.input, args.out, args.tokenizer, args.val_every, workers=args.workers, engine=args.engine)
     print(f"{stats['docs']} 篇；训练 {stats['train'] / 1e6:.1f}M 词，验证 {stats['val'] / 1e6:.2f}M 词 → {args.out}")
 
 
