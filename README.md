@@ -11,9 +11,9 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 - **后训练做全套**：SFT → 领域专家 → 多老师在线蒸馏（MOPD）→ 强化学习（RLVR、agent RL、RLAIF），10 种题型、各自的判分器。
 - **以中文为主**：分词器、数据配比、评分细则都按中文定，另外专门放了古文、诗词、鲁迅全集。
 
-> **现状（2026-11-13）**：模型、数据流水线、四档预训练数据、整套后训练（SFT、MOPD、RL）和评测都写完了，有测试；
+> **现状（2026-11-14）**：模型、数据流水线、四档预训练数据、整套后训练（SFT、MOPD、RL）和评测都写完了，有测试；
 > 在一个 2300 万参数的演示模型上，用最终的数据把整条链（预训练 → 退火 → SFT → agent RL → RLAIF → 专家 → RLVR → MOPD → 评测）跑通过。
-> **还没有在显卡上正式训练过**：small 训一遍要多久、能力怎么样，都还没测。CUDA 上的路径（bf16、编译、分块窗口注意力、CUDA graph）只在 CPU 上验证过数值正确。
+> **small 正在 RTX 5070 Ti 16GB 上正式预训练**：2048 × 16 配置稳态约 7.1 万 token/秒、0.46 秒/步；采样到的进程专用显存峰值约 12.54 GiB。CUDA 路径已做输出、梯度、优化器恢复和完整训练步验证。训练仍在早期，生成质量尚未成熟。
 
 ---
 
@@ -42,6 +42,18 @@ pip install -e ".[data]"          # 要 Python 3.11+、PyTorch 2.5+（用 PyTorc
 pip install -e ".[fast]"          # 可选：切词改用 gigatoken，快一个数量级，结果一字节不差（Windows 上建议在 WSL 里装）
 ```
 
+CUDA 训练加速使用 **Liger Kernel 0.8.5+**（融合输出层交叉熵、静态 mHC 读写、RMSNorm、RoPE、ReLU²）和 **PyTorch FlexAttention**（原生 GQA、滑动窗口）。Linux 可安装 `pip install -e ".[data,cuda]"`；Windows 先准备匹配 PyTorch 的 `triton-windows`，再安装 `pip install --no-deps liger-kernel==0.8.5`，避免 pip 拉取不支持 Windows 的标准 Triton 包。CPU 保留普通 PyTorch 实现。
+
+`python -m tools.bench small --batch 16 --seq 2048` 测完整的前向、反向和优化器更新；CUDA 默认使用选择性激活重计算，可用 `--checkpoint-policy full` 改为整层重算，或 `--no-checkpoint` 关闭重算。主干逐层编译，Engram 查表、流入口、出口和 Sinkhorn 也参与编译。mHC 使用 Liger 原有内核直接写入输入精度的缓冲区，减少 FP32 临时张量；内核内仍用 FP32 计算。预训练和 SFT 使用同一套融合损失与加速算子。
+
+预训练和 bench 可加 `--cuda-graph` 捕获融合 Adam 与自定义 Muon 的更新图，学习率保留在设备张量中逐步更新；检查点仍保存完整优化器状态。`--autotune` 搜索固定形状下的矩阵和注意力内核，首次编译较久。预训练默认每 50 步记录日志，可用 `--log-every` 修改。例如 `python -m training.train_pretrain --data data/tokens/base --out out/small/pretrain --preset small --seq-len 2048 --batch-size 16 --epochs 1 --cuda-graph --log-every 50`；从已有存档继续时加 `--resume`。
+
+CUDA 训练时把 Q、K、V 投影合并成一次矩阵乘法，参数和检查点中仍分别保存三组权重。验证和带缓存的生成保留原来的投影路径。
+
+Windows 默认编码为 GBK 时用 `python -X utf8 -m tools.bench small --batch 8 --seq 4096`。如果 Triton 默认缓存目录报路径错误，可在 PowerShell 中先设置 `$env:TRITON_CACHE_DIR = "$PWD\.cache\triton"` 和 `$env:TORCHINDUCTOR_CACHE_DIR = "$PWD\.cache\inductor"`。
+
+训练中也可以接入 TensorBoard：安装 `pip install -e ".[monitor]"`，运行 `python -m tools.tensorboard --run out/small/pretrain`，再运行 `python -m tensorboard.main --logdir out/small/pretrain/tensorboard --host 127.0.0.1 --port 6006`，打开 `http://127.0.0.1:6006`。同步工具会补录已有 JSONL 指标并持续追加训练/验证损失、各参数组学习率、吞吐和进度；不需要重启训练。历史数据的横轴使用训练步数。
+
 **1. 拿到数据**（二选一）
 
 ```bash
@@ -59,7 +71,7 @@ python -m dataset.build
 python -m tools.bench small --batch 4 --seq 4096                                          # 先量这张卡的速度和显存峰值，批大小按它定
 python -m tools.prepare --input data/pretrain_mini.parquet --out data/tokens/mini        # 切词
 python -m training.train_pretrain --data data/tokens/mini --out out/small/pretrain \
-    --preset small --seq-len 4096 --batch-size 4 --grad-accum 2 --epochs 1                # 中断后加 --resume 接着跑
+    --preset small --seq-len 2048 --batch-size 16 --epochs 1                              # 中断后加 --resume 接着跑
 ```
 
 显存不够就把 `--batch-size` 减半、`--grad-accum` 加倍，等效的批大小不变。

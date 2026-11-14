@@ -50,7 +50,11 @@ class Muon(torch.optim.Optimizer):
                 update = orthogonalize(update.bfloat16() if half else update, group["ns_steps"]).to(grads.dtype)
                 scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
                 for p, u in zip(params, update):
+                    lr = group["lr"]
                     if group["weight_decay"]:
-                        p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(u, alpha=-group["lr"] * scale)
+                        p.mul_(1 - lr * group["weight_decay"])
+                    if isinstance(lr, torch.Tensor):
+                        p.add_(u * (-lr * scale))
+                    else:
+                        p.add_(u, alpha=-lr * scale)
         return loss

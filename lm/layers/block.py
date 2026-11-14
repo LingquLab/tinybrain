@@ -26,9 +26,9 @@ class Block(nn.Module):
             self.ffn = FeedForward(cfg.dim, int(cfg.ffn_mult * cfg.dim))
 
     def forward(self, x, cos, sin, maps, memory=None, cache: LayerCache | None = None):
-        """x: (B, T, n, d)；maps: 全模型的 (pre, post, res)，这一层用其中第 2i 和 2i+1 组。返回 (x, 均衡损失)。"""
+        """maps 可传全模型的系数，或只传这一层的两组系数。返回 (x, 均衡损失)。"""
         pre, post, res = maps
-        a, f = 2 * self.index, 2 * self.index + 1
+        a, f = (0, 1) if pre.size(0) == 2 else (2 * self.index, 2 * self.index + 1)
         if self.engram is not None:
             x = self.engram(x, memory)
         x = write_streams(x, self.attn(self.attn_norm(read_streams(x, pre[a])), cos, sin, cache), res[a], post[a])

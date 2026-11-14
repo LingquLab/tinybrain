@@ -1,4 +1,10 @@
+import torch
 import torch.nn as nn
+
+try:
+    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+except ImportError:
+    LigerRMSNormFunction = None
 
 
 class RMSNorm(nn.RMSNorm):
@@ -9,3 +15,9 @@ class RMSNorm(nn.RMSNorm):
 
     def __init__(self, dim: int):
         super().__init__(dim)
+
+    def forward(self, x):
+        if x.is_cuda and x.dtype != torch.float64 and LigerRMSNormFunction is not None:
+            eps = self.eps if self.eps is not None else torch.finfo(x.dtype).eps
+            return LigerRMSNormFunction.apply(x, self.weight, eps, 0.0, "gemma", False)
+        return super().forward(x)

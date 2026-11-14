@@ -40,11 +40,29 @@ def autocast(device: torch.device):
     return contextlib.nullcontext()
 
 
-def compile_model(model: torch.nn.Module, device: torch.device, enabled: bool = True) -> torch.nn.Module:
-    """CUDA 上用 torch.compile 编译前向。带 MoE 的模型每步各专家分到的词数不同，编译器会反复重编，所以不编。"""
+def compile_model(model: torch.nn.Module, device: torch.device, enabled: bool = True, seq_len: int | None = None,
+                  autotune: bool = False) -> torch.nn.Module:
+    """CUDA 上编译前向；激活重计算时逐层编译，保留层间的释放边界。MoE 不编译。"""
+    if device.type == "cuda":
+        from lm.loss import LigerFusedLinearCrossEntropyFunction
+        if LigerFusedLinearCrossEntropyFunction is None:
+            raise RuntimeError("CUDA 加速需要 liger-kernel>=0.8.5；Linux 安装 .[cuda]，Windows 配好 triton-windows 后用 --no-deps 安装 liger-kernel。")
+        for block in model.blocks:
+            block.attn.prepare(seq_len or block.attn._flex_length or model.cfg.max_seq_len, device)
     if not enabled or device.type != "cuda" or getattr(getattr(model, "cfg", None), "moe_experts", 0):
         return model
-    return torch.compile(model, dynamic=False)
+    options = {"triton.cudagraphs": False, "max_autotune": autotune}
+    if getattr(model, "gradient_checkpointing", False):
+        # 整图 AOT 反向会把多层 mHC 的布局转换、重算结果同时保留。
+        # checkpoint 放在编译区域外，让每层反向结束后即可释放临时激活。
+        from lm.checkpointing import checkpoint_block
+        for module in (model.memory, model.entry, model.exit):
+            if module is not None:
+                module.compile(fullgraph=True, dynamic=False, options=options)
+        model.hyper.mappings = torch.compile(model.hyper.mappings, fullgraph=True, dynamic=False, options=options)
+        model.checkpoint_block = torch.compile(checkpoint_block, dynamic=False, options=options)
+        return model
+    return torch.compile(model, dynamic=False, options=options)
 
 
 def peak_memory_gb(device: torch.device) -> float | None:
@@ -73,7 +91,11 @@ def set_lr_scale(optimizers: list[torch.optim.Optimizer], scale: float) -> None:
     """把所有组的学习率设成各自起步值的 scale 倍。"""
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["base_lr"] * scale
+            value = group["base_lr"] * scale
+            if isinstance(group["lr"], torch.Tensor):
+                group["lr"].fill_(value)
+            else:
+                group["lr"] = value
 
 
 # ---------- 优化器：矩阵始终用 Muon，其余（词向量、输出层、记忆表、归一化系数和零碎的标量）用 Adam

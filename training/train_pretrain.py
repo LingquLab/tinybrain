@@ -73,7 +73,7 @@ def evaluate(model, data, args, device: torch.device) -> float:
     for i in range(args.eval_batches):
         x, y = data.batch(args.batch_size, args.seq_len, seed=1_000_003 * (i + 1), device=device)
         with autocast(device):
-            out = model(x, y)
+            out = model(x, y, return_logits=False)
         total += (out.loss - out.balance_loss).item()
     model.train(was_training)
     return total / args.eval_batches
@@ -101,6 +101,8 @@ def train(args) -> dict:
 
     # 模型和优化器
     model, origin = build_model(args, train_data.vocab_size, device)
+    model.gradient_checkpointing = device.type == "cuda" and not model.cfg.moe_experts
+    model.checkpoint_policy = "selective"
     windows = train_data.windows(args.seq_len)
     steps = total_steps(args, windows)
     rows_per_step = args.batch_size * args.grad_accum
@@ -108,7 +110,14 @@ def train(args) -> dict:
     start_step = resume(out / "ckpt.pt", model, optimizers, device) if args.resume else 0
     (out / "config.json").write_text(json.dumps({"train": vars(args), "steps": steps, "model": json.loads(model.cfg.to_json()), "data": train_data.meta},
                                                 ensure_ascii=False, indent=1), encoding="utf-8")
-    forward = compile_model(model, device, enabled=not args.no_compile)
+    forward = compile_model(model, device, enabled=not args.no_compile, seq_len=args.seq_len, autotune=args.autotune)
+    graph_step = None
+    if args.cuda_graph:
+        if device.type != "cuda" or model.cfg.moe_experts:
+            raise ValueError("--cuda-graph 要求 CUDA 和普通前馈模型")
+        from .cuda_graph import OptimizerGraph
+        graph_step = OptimizerGraph(optimizers)
+        print("已启用优化器图重放；首步预热和捕获。", flush=True)
     report = model.param_report()
     tokens_per_step = rows_per_step * args.seq_len
     print(f"设备 {device}；模型 {origin}，共 {report['合计'] / 1e6:.1f}M 参数（主干 {report['主干'] / 1e6:.1f}M）；"
@@ -127,12 +136,15 @@ def train(args) -> dict:
             for micro in range(args.grad_accum):  # 攒几个批次的梯度再更新一次
                 x, y = train_data.ordered_batch(args.batch_size, args.seq_len, index=step * args.grad_accum + micro, seed=args.seed, device=device)
                 with autocast(device):
-                    loss = forward(x, y).loss / args.grad_accum
+                    loss = forward(x, y, return_logits=False).loss / args.grad_accum
                 loss.backward()
                 loss_value += loss.item()
             if not math.isfinite(loss_value):
                 raise RuntimeError(f"第 {step} 步的损失变成了 {loss_value}，训练停下。上一个存档在 {out / 'ckpt.pt'}")
-            step_optimizers(optimizers)
+            if graph_step is None:
+                step_optimizers(optimizers)
+            else:
+                graph_step()
             smooth = loss_value if smooth is None else 0.9 * smooth + 0.1 * loss_value
 
             # 记录、验证、存档
@@ -190,7 +202,7 @@ def parse_args(argv=None):
     add_optimizer_args(p)
 
     g = p.add_argument_group("记录和存档")
-    g.add_argument("--log-every", type=int, default=10)
+    g.add_argument("--log-every", type=int, default=50)
     g.add_argument("--eval-every", type=int, default=200, help="每隔多少步在验证集上量一次；没有验证集就不量")
     g.add_argument("--eval-batches", type=int, default=20)
     g.add_argument("--save-every", type=int, default=500)
@@ -199,6 +211,8 @@ def parse_args(argv=None):
     g = p.add_argument_group("硬件")
     g.add_argument("--device", default="auto", help="auto、cuda、mps 或 cpu")
     g.add_argument("--no-compile", action="store_true", help="CUDA 上也不用 torch.compile")
+    g.add_argument("--cuda-graph", action="store_true", help="捕获融合 Adam 和 Muon 更新图；只支持 CUDA 普通前馈模型、自定义 Muon")
+    g.add_argument("--autotune", action="store_true", help="为固定形状搜索更快的矩阵和注意力内核；首次启动编译更久")
     return p.parse_args(argv)
 
 

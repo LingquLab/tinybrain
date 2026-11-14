@@ -49,7 +49,7 @@ def evaluate(model, data: PackedData, args, device: torch.device) -> float:
     for i in range(args.eval_batches):
         x, y = data.batch(args.batch_size, data.row_len - 1, seed=1_000_003 * (i + 1), device=device)
         with autocast(device):
-            out = model(x, y)
+            out = model(x, y, return_logits=False)
         total += (out.loss - out.balance_loss).item()
     model.train(was_training)
     return total / args.eval_batches
@@ -70,6 +70,8 @@ def train(args) -> dict:
 
     # 模型和优化器
     model = load_model(Path(args.init), device)
+    model.gradient_checkpointing = device.type == "cuda" and not model.cfg.moe_experts
+    model.checkpoint_policy = "selective"
     if model.cfg.vocab_size != train_data.vocab_size:
         raise ValueError(f"模型的词表是 {model.cfg.vocab_size}，数据是用 {train_data.vocab_size} 的词表切的")
     if seq_len > model.cfg.max_seq_len:
@@ -78,7 +80,7 @@ def train(args) -> dict:
     start_step = resume(out / "ckpt.pt", model, optimizers, device) if args.resume else 0
     (out / "config.json").write_text(json.dumps({"sft": vars(args), "steps": steps, "model": json.loads(model.cfg.to_json()), "data": train_data.meta},
                                                 ensure_ascii=False, indent=1), encoding="utf-8")
-    forward = compile_model(model, device, enabled=not args.no_compile)
+    forward = compile_model(model, device, enabled=not args.no_compile, seq_len=seq_len)
     print(f"设备 {device}；从 {args.init} 出发；{train_data.rows} 行对话（每行 {seq_len} 词）；"
           f"每步 {args.batch_size * args.grad_accum} 行，共 {steps} 步（约 {steps * args.batch_size * args.grad_accum / train_data.rows:.2f} 轮）", flush=True)
 
@@ -95,7 +97,7 @@ def train(args) -> dict:
                 x, y = train_data.ordered_batch(args.batch_size, seq_len, index=step * args.grad_accum + micro, seed=args.seed, device=device)
                 learned += int((y != -1).sum())
                 with autocast(device):
-                    loss = forward(x, y).loss / args.grad_accum
+                    loss = forward(x, y, return_logits=False).loss / args.grad_accum
                 loss.backward()
                 loss_value += loss.item()
             if not math.isfinite(loss_value):

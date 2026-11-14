@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ModelConfig
+from .checkpointing import checkpoint_block
 from .layers.attention import LayerCache
 from .layers.block import Block
 from .layers.engram import EngramMemory
@@ -14,10 +15,11 @@ from .layers.hyper import HyperConnections
 from .layers.norm import RMSNorm
 from .layers.rotary import rotary_tables
 from .layers.streams import StreamEntry, StreamExit
+from .loss import linear_cross_entropy
 
 
 class Output(NamedTuple):
-    logits: torch.Tensor | None      # (B, T, 词表大小)；给了 targets 时是 None（只算损失，不留整张输出）
+    logits: torch.Tensor | None      # (B, T, 词表大小)；给了 targets 时默认省略（只算损失），要的话传 return_logits=True
     loss: torch.Tensor | None        # 给了 targets 才有：交叉熵加上均衡损失
     balance_loss: torch.Tensor       # MoE 的均衡损失（已乘权重）；没有 MoE 时是 0
 
@@ -37,6 +39,9 @@ class LanguageModel(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
+        self.gradient_checkpointing = False
+        self.checkpoint_policy = "full"
+        self.checkpoint_block = checkpoint_block
         self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.embed_norm = RMSNorm(cfg.dim)
         self.memory = None
@@ -77,8 +82,10 @@ class LanguageModel(nn.Module):
             else:
                 raise RuntimeError(f"参数 {name} 没有规定怎么初始化")
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, state: DecodeState | None = None) -> Output:
-        """idx: (B, T) 的词编号。targets 里等于 -1 的位置不算损失。state 只在逐词生成时传。"""
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, state: DecodeState | None = None,
+                return_logits: bool | None = None) -> Output:
+        """idx: (B, T) 的词编号。targets 里等于 -1 的位置不算损失。state 只在逐词生成时传。
+        return_logits 不写时：没给 targets 就返回整张输出，给了 targets 就只算损失（省下「词数 × 词表」那么大的一份显存）。"""
         B, T = idx.shape
         pos = state.pos if state is not None else 0
         if pos + T > self.cfg.max_seq_len:
@@ -95,34 +102,30 @@ class LanguageModel(nn.Module):
         maps = self.hyper.mappings(x.dtype)
         balance = x.new_zeros((), dtype=torch.float32)
         for i, block in enumerate(self.blocks):
-            x, b = block(x, cos, sin, maps, memory, state.layers[i] if state is not None else None)
+            # MoE 前向会更新路由偏置，不能直接重算；带生成缓存时也不能重算。
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled() and state is None and not self.cfg.moe_experts:
+                layer_maps = tuple(m[2 * i:2 * i + 2] for m in maps)
+                x, b = self.checkpoint_block(block, x, cos, sin, layer_maps, memory, self.checkpoint_policy)
+            else:
+                x, b = block(x, cos, sin, maps, memory, state.layers[i] if state is not None else None)
             balance = balance + b.float()
         balance = self.cfg.moe_balance_loss * balance
 
-        h = self.final_norm(self.exit(x))
-        logits = loss = None
-        if targets is None:
-            logits = self.head(h).float()
-        else:
-            loss = self.chunked_loss(h, targets) + balance
+        hidden = self.final_norm(self.exit(x))
+        want_logits = targets is None if return_logits is None else return_logits
+        logits = self.head(hidden).float() if want_logits else None
+        loss = None
+        if targets is not None:
+            if logits is None:  # CUDA 上装了 Liger 用融合的输出层加交叉熵，否则分块算；两者结果和一次算完相同
+                loss = linear_cross_entropy(hidden, self.head.weight, targets, chunk=self.loss_chunk) + balance
+            else:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1) + balance
         if state is not None:
             state.pos = pos + T
             if self.memory is not None and self.memory.history_len:
                 past = state.history if state.history is not None else idx.new_full((B, self.memory.history_len), self.memory.pad_id)
                 state.history = torch.cat([past, idx], dim=1)[:, -self.memory.history_len:]
         return Output(logits, loss, balance)
-
-    def chunked_loss(self, h: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """交叉熵，和一次算完的结果一样，只是一块一块地过输出层。
-
-        整张输出是「词数 × 词表」那么大：8 × 4096 个词、32768 的词表，单精度一份就是 4 GB，一次算完时前向和反向里会同时
-        有好几份。分块以后同时存在的只有一块的输出，外加反向要用的那一份对数概率。"""
-        h, targets = h.reshape(-1, h.size(-1)), targets.reshape(-1)
-        total = h.new_zeros((), dtype=torch.float32)
-        for start in range(0, targets.numel(), self.loss_chunk):
-            logits = self.head(h[start:start + self.loss_chunk]).float()
-            total = total + F.cross_entropy(logits, targets[start:start + self.loss_chunk], ignore_index=-1, reduction="sum")
-        return total / (targets != -1).sum()
 
     def new_state(self) -> DecodeState:
         return DecodeState(self.cfg.n_layers)

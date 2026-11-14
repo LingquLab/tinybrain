@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from liger_kernel.ops.relu_squared import LigerReLUSquaredFunction
+except ImportError:
+    LigerReLUSquaredFunction = None
+
 
 class FeedForward(nn.Module):
     """前馈层，激活函数是 ReLU 的平方。输出投影从零开始，所以刚初始化时这一层什么都不加。"""
@@ -12,4 +17,9 @@ class FeedForward(nn.Module):
         self.proj = nn.Linear(hidden, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(F.relu(self.fc(x)).square())
+        hidden = self.fc(x)
+        if hidden.is_cuda and LigerReLUSquaredFunction is not None:
+            hidden = LigerReLUSquaredFunction.apply(hidden)
+        else:
+            hidden = F.relu(hidden).square()
+        return self.proj(hidden)

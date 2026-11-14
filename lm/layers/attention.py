@@ -1,18 +1,28 @@
 """因果自注意力：分组查询（GQA）、查询和键先归一化（QK-norm）、旋转位置编码，可选只看最近 window 个词。
 
 三条计算路径：
-  1. 看全文，或者序列不比窗口长：直接调 scaled_dot_product_attention（CUDA 上走 flash 内核）。
-  2. 序列比窗口长：把序列切成窗口那么长的块，每块的查询只和「上一块加本块」的键算，
-     计算量从 T×T 降到 T×2W。结果和逐位置加掩码完全一样。这一步带掩码，键值先按组复制到和查询一样多的头：
-     多数 PyTorch 版本里，带掩码能用的融合内核不支持分组查询，不复制就会退回把整张注意力矩阵算出来的慢路径。
+  1. CUDA 上训练和整段前向：FlexAttention。窗口和因果写成一条掩码规则，编成块稀疏的掩码，只算窗口里的那条带子；
+     原生支持分组查询，不复制键值。头宽小于 16 时退回第 2 条。
+  2. CPU、MPS：scaled_dot_product_attention。窗口层带一张 T×T 的掩码（只在小模型和短序列上用，简单优先）。
   3. 逐词生成：新来的一个词和缓存里的键值算，窗口层的缓存只留最近 W 个。
+CUDA 训练时 Q、K、V 三个投影合成一次矩阵乘法，参数和存档里仍是三组权重。
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from .norm import RMSNorm
-from .rotary import apply_rotary
+from .rotary import apply_rotary_qk
+
+
+_flex_attention = torch.compile(flex_attention, fullgraph=True, dynamic=False,
+                                options={"triton.cudagraphs": False})
+
+
+def grouped_attention(q, k, v, *, attn_mask=None, is_causal=False):
+    """CPU 或逐词解码使用标准 SDPA。"""
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal, enable_gqa=True)
 
 
 class LayerCache:
@@ -31,49 +41,58 @@ class Attention(nn.Module):
         self.v = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
         self.q_norm, self.k_norm = RMSNorm(self.head_dim), RMSNorm(self.head_dim)
-        if window is not None:
-            i, j = torch.arange(window)[:, None], torch.arange(2 * window)[None, :]
-            # 查询在「上一块+本块」这 2W 个键里的位置是 W+i，它能看 i+1 到 W+i 这 W 个
-            self.register_buffer("block_mask", (j > i) & (j <= window + i), persistent=False)
+        self._flex_mask = None
+        self._flex_length = 0
+        self.fuse_qkv = True
+
+    def prepare(self, length, device):
+        """在编译前构建稀疏块掩码；同一形状的训练步复用它。"""
+        if self._flex_length == length and self._flex_mask is not None:
+            if self._flex_mask.kv_indices.device == torch.device(device):
+                return
+        window = self.window
+        if window is None:
+            def mask(b, h, q, k):
+                return q >= k
+        else:
+            def mask(b, h, q, k):
+                return (q >= k) & (q - k < window)
+        self._flex_mask = create_block_mask(mask, None, None, length, length, device=str(device))
+        self._flex_length = length
+
+    def attend(self, q, k, v):
+        length = q.size(-2)
+        if q.is_cuda and q.size(-1) >= 16:
+            if self._flex_length != length or self._flex_mask is None:
+                self.prepare(length, q.device)
+            return _flex_attention(q, k, v, block_mask=self._flex_mask, enable_gqa=True)
+        if self.window is None:
+            return grouped_attention(q, k, v, is_causal=True)
+        pos = torch.arange(length, device=q.device)
+        mask = (pos[:, None] >= pos[None, :]) & (pos[:, None] - pos[None, :] < self.window)
+        return grouped_attention(q, k, v, attn_mask=mask)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache: LayerCache | None = None) -> torch.Tensor:
         B, T, _ = x.shape
-        q = self.q(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        q, k = apply_rotary(self.q_norm(q), cos, sin), apply_rotary(self.k_norm(k), cos, sin)
+        if self.fuse_qkv and self.training and x.is_cuda and cache is None:
+            q_size, kv_size = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
+            q, k, v = F.linear(x, torch.cat((self.q.weight, self.k.weight, self.v.weight))).split((q_size, kv_size, kv_size), dim=-1)
+        else:
+            q, k, v = self.q(x), self.k(x), self.v(x)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q, k = apply_rotary_qk(self.q_norm(q), self.k_norm(k), cos, sin)
         if cache is not None and cache.k is not None:
             if T != 1:
                 raise ValueError("缓存里已经有内容时，一次只能再送进一个词")
             k, v = torch.cat([cache.k, k], dim=2), torch.cat([cache.v, v], dim=2)
             if self.window is not None:
                 k, v = k[:, :, -self.window:], v[:, :, -self.window:]
-            out = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
-        elif self.window is None or T <= self.window:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+            out = grouped_attention(q, k, v)
         else:
-            out = self._windowed(q, k, v)
+            out = self.attend(q, k, v)
         if cache is not None:
             keep = slice(None) if self.window is None else slice(-self.window, None)
             cache.k, cache.v = k[:, :, keep], v[:, :, keep]
         return self.proj(out.transpose(1, 2).reshape(B, T, -1))
-
-    def _windowed(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        B, _, T, D = q.shape
-        W = self.window
-        n_blocks = -(-T // W)
-        if n_blocks * W != T:  # 末尾补齐成整块：补的位置在所有真实位置之后，因果掩码会挡住
-            q, k, v = (F.pad(t, (0, 0, 0, n_blocks * W - T)) for t in (q, k, v))
-
-        def blocks(t, lo, hi):  # 取第 lo 到 hi 块，形状 (B, 块数, 头数, W, 头宽)
-            return t.view(B, t.size(1), n_blocks, W, D)[:, :, lo:hi].transpose(1, 2)
-
-        first = F.scaled_dot_product_attention(q[:, :, :W], k[:, :, :W], v[:, :, :W], is_causal=True, enable_gqa=True)
-        qb = blocks(q, 1, n_blocks).reshape(-1, self.n_heads, W, D)
-        kb = torch.cat([blocks(k, 0, n_blocks - 1), blocks(k, 1, n_blocks)], dim=-2).reshape(-1, self.n_kv_heads, 2 * W, D)
-        vb = torch.cat([blocks(v, 0, n_blocks - 1), blocks(v, 1, n_blocks)], dim=-2).reshape(-1, self.n_kv_heads, 2 * W, D)
-        group = self.n_heads // self.n_kv_heads
-        kb, vb = kb.repeat_interleave(group, dim=1), vb.repeat_interleave(group, dim=1)
-        rest = F.scaled_dot_product_attention(qb, kb, vb, attn_mask=self.block_mask)
-        rest = rest.view(B, n_blocks - 1, self.n_heads, W, D).transpose(1, 2).reshape(B, self.n_heads, -1, D)
-        return torch.cat([first, rest], dim=2)[:, :, :T]

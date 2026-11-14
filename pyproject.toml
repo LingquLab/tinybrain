@@ -13,6 +13,8 @@ dependencies = ["torch>=2.5"]
 [project.optional-dependencies]
 data = ["numpy", "pyarrow", "OpenCC", "zstandard"]
 fast = ["gigatoken"]  # 切词快一个数量级（tools.prepare 自动使用）；Windows 上建议在 WSL 里装
+cuda = ["liger-kernel>=0.8.5,<0.9"]
+monitor = ["tensorboard>=2.18"]
 
 [tool.setuptools.packages.find]
 include = ["lm*", "training*", "inference*", "eval*", "tools*", "dataset*"]

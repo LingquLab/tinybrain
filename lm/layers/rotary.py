@@ -1,6 +1,11 @@
 """旋转位置编码（RoPE）：把每个头的向量两两配对，按位置转一个角度。"""
 import torch
 
+try:
+    from liger_kernel.ops.rope import LigerRopeFunction
+except ImportError:
+    LigerRopeFunction = None
+
 
 def rotary_tables(head_dim: int, seq_len: int, base: float = 10000.0) -> tuple[torch.Tensor, torch.Tensor]:
     """返回 (cos, sin)，形状都是 (seq_len, head_dim // 2)。"""
@@ -15,3 +20,10 @@ def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     cos, sin = cos.to(x.dtype), sin.to(x.dtype)  # 半精度下不能让表把结果抬回单精度
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat([x1 * cos + x2 * sin, x2 * cos - x1 * sin], dim=-1)
+
+
+def apply_rotary_qk(q, k, cos, sin):
+    if q.is_cuda and q.dtype != torch.float64 and LigerRopeFunction is not None:
+        # 本项目用负角度约定；Liger 的 Llama 约定取相反的 sin。
+        return LigerRopeFunction.apply(q, k, cos.to(q.dtype), -sin.to(q.dtype), None, 1, q.size(-1))
+    return apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)
