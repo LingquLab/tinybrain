@@ -2,6 +2,9 @@
 
     python -m tools.prepare --input "data/mix/out/nano/*.parquet" --out data/tokens/nano
 
+编码在 --workers 个进程里并行（默认用满所有核），每个进程单线程跑 SentencePiece，主进程按原来的顺序收回来写盘，
+结果和单进程逐篇编码一字节不差。
+
 --tokenizer 默认是仓库里的正式分词器 tokenizer/tokenizer.model；也可以换成别的 SentencePiece .model 文件，或者 bytes：
 把 UTF-8 的每个字节当成一个词（0 是文档结束符，字节 b 记作 b+1，词表 257），只用来在没有分词器时跑通流程。
 用 .model 时会把它复制进输出目录，数据目录自己就能说清楚是用哪个分词器切的。
@@ -12,14 +15,17 @@
     python -m tools.prepare --chat --input data/sft.parquet --out data/tokens/sft-small --seq-len 2048
 """
 import argparse
+import collections
 import glob
+import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 
-from training.dataset import ShardWriter, write_meta
+# training.dataset 在用到的函数里才导入：它会带进 torch，编码进程用不着，每个进程省一两秒启动和几百 MB 内存
 
 EOS = 0
 
@@ -50,23 +56,77 @@ def default_tokenizer() -> str:
     return str(DEFAULT_MODEL)
 
 
-def prepare(inputs: list[str], out: str, tokenizer: str | None = None, val_every: int = 1000, shard_tokens: int = 100_000_000, threads: int = 4) -> dict:
-    """读 parquet 文件的 text 列，每篇后面接一个结束符。每 val_every 篇里拿一篇放进验证集。返回各部分的词数。"""
+_worker = {}
+
+
+def _start_worker(tokenizer: str) -> None:
+    encode, _, eos, _ = load_encoder(tokenizer, threads=1)
+    _worker.update(encode=encode, eos=eos)
+
+
+def _encode_batch(job: tuple) -> dict:
+    """一批文档 → {"train": 数组, "val": 数组}：每篇后面接结束符，按篇的全局编号分到训练集或验证集。"""
+    first, texts, val_every, dtype = job
+    parts = {"train": [], "val": []}
+    for k, ids in enumerate(_worker["encode"](texts)):
+        parts["val" if val_every and (first + k) % val_every == val_every - 1 else "train"].append(ids)
+    out = {}
+    for split, docs in parts.items():
+        arr, pos = np.empty(sum(len(d) + 1 for d in docs), dtype=dtype), 0
+        for d in docs:
+            arr[pos:pos + len(d)] = d
+            arr[pos + len(d)] = _worker["eos"]
+            pos += len(d) + 1
+        out[split] = arr
+    return out
+
+
+def prepare(inputs: list[str], out: str, tokenizer: str | None = None, val_every: int = 1000, shard_tokens: int = 100_000_000,
+            workers: int | None = None, batch_docs: int = 1000) -> dict:
+    """读 parquet 文件的 text 列，每篇后面接一个结束符。每 val_every 篇里拿一篇放进验证集。返回各部分的词数。
+    workers 是编码进程数，默认等于 CPU 核数；1 就在本进程里编。"""
+    from training.dataset import ShardWriter, write_meta
+
     tokenizer = tokenizer or default_tokenizer()
-    encode, vocab_size, eos, kind = load_encoder(tokenizer, threads)
+    _, vocab_size, eos, kind = load_encoder(tokenizer)
     dtype = "uint16" if vocab_size <= 1 << 16 else "uint32"
     files = sorted(f for pattern in inputs for f in glob.glob(pattern))
     if not files:
         raise FileNotFoundError(f"没有找到输入文件：{inputs}")
     out = Path(out)
     writers = {"train": ShardWriter(out, "train", dtype, shard_tokens), "val": ShardWriter(out, "val", dtype, shard_tokens)}
+    workers = workers or os.cpu_count() or 1
+
+    def jobs():
+        first = 0
+        for path in files:
+            for batch in pq.ParquetFile(path).iter_batches(batch_size=batch_docs, columns=["text"]):
+                texts = batch.column("text").to_pylist()
+                yield first, texts, val_every, dtype
+                first += len(texts)
+
+    def write(result: dict) -> None:
+        for split, arr in result.items():
+            if arr.size:
+                writers[split].write(arr)
+
     n_docs = 0
-    for path in files:
-        for batch in pq.ParquetFile(path).iter_batches(batch_size=1000, columns=["text"]):
-            for ids in encode(batch.column("text").to_pylist()):
-                split = "val" if val_every and n_docs % val_every == val_every - 1 else "train"
-                writers[split].write(np.append(np.asarray(ids, dtype=np.int64), eos))
-                n_docs += 1
+    if workers == 1:
+        _start_worker(tokenizer)
+        for job in jobs():
+            write(_encode_batch(job))
+            n_docs += len(job[1])
+    else:
+        # 同时在路上的批数有上限：读得比编得快时不会把整个文件读进内存
+        with ProcessPoolExecutor(workers, initializer=_start_worker, initargs=(tokenizer,)) as pool:
+            pending = collections.deque()
+            for job in jobs():
+                pending.append(pool.submit(_encode_batch, job))
+                n_docs += len(job[1])
+                if len(pending) >= 2 * workers:
+                    write(pending.popleft().result())
+            while pending:
+                write(pending.popleft().result())
     for w in writers.values():
         w.close()
     extra = {}
@@ -82,7 +142,7 @@ def prepare_chat(inputs: list[str], out: str, seq_len: int, tokenizer: str | Non
     """对话数据：编码、按 seq_len + 1 打包，写出 train/val 的 .ids.bin 和 .mask.bin。返回各部分的统计。"""
     from inference.template import ChatFormat
     from inference.tokenizer import Tokenizer
-    from training.dataset import pack
+    from training.dataset import pack, write_meta
 
     path = tokenizer or default_tokenizer()
     tok = Tokenizer(path)
@@ -131,7 +191,7 @@ def main(argv=None):
     parser.add_argument("--out", required=True)
     parser.add_argument("--tokenizer", default=None, help="SentencePiece 的 .model 文件，或者 bytes；默认是 tokenizer/tokenizer.model")
     parser.add_argument("--val-every", type=int, default=1000, help="每多少篇里拿一篇放进验证集；0 表示不留")
-    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=None, help="编码用几个进程，默认等于 CPU 核数")
     parser.add_argument("--chat", action="store_true", help="输入是对话（messages 列），打包成 SFT 用的数据")
     parser.add_argument("--seq-len", type=int, default=2048, help="--chat 时每行的片段长度")
     parser.add_argument("--train-on", choices=["assistant", "all"], default="assistant", help="--chat 时哪些词算损失")
@@ -142,7 +202,7 @@ def main(argv=None):
             print(f"{split}：{st['examples']} 段对话打成 {st['rows']} 行，要学的词 {st['target_tokens'] / 1e6:.2f}M，"
                   f"太长丢掉 {st['dropped_too_long']} 段")
         return
-    stats = prepare(args.input, args.out, args.tokenizer, args.val_every, threads=args.threads)
+    stats = prepare(args.input, args.out, args.tokenizer, args.val_every, workers=args.workers)
     print(f"{stats['docs']} 篇；训练 {stats['train'] / 1e6:.1f}M 词，验证 {stats['val'] / 1e6:.2f}M 词 → {args.out}")
 
 
