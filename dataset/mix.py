@@ -22,7 +22,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from dataset.sources import CLEAN, PRETRAIN, ROOT
+from dataset.sources import CLEAN, DATA, PRETRAIN, RL_INPUTS, ROOT, SFT
 
 MIX_DIR = ROOT / "data" / "mix"   # 中间结果：索引、计划、分桶
 FINAL_DIR = ROOT / "data"          # 最后只留下 data/pretrain_<档>.parquet 这四个文件
@@ -435,6 +435,76 @@ def dataset_card(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# 后训练数据：发布到 posttrain/ 下的文件和它们是什么（dataset/sft.py、dataset/rl.py 写出来的）
+POSTTRAIN_FILES = {
+    "sft_small": "SFT 小档：去掉推理过程，每条最长 2048 词，外部来源只留质量好的一半",
+    "sft_medium": "SFT 中档：推理过程写成 <think>…</think>，每条最长 4096 词",
+    "sft_large": "SFT 大档：再加上更长的推理数据，每条最长 8192 词",
+    "sft_heldout": "从每个外部来源留出的约 2%，不进 SFT（给 RL 出题和评测用）",
+    "sft_expert_math": "数学专家的 SFT", "sft_expert_code": "代码专家的 SFT", "sft_expert_literature": "文学专家的 SFT（文言、诗词）",
+    "rl_small": "RL 小档：指令跟随、阅读、诗词、工具调用、评审题",
+    "rl_medium": "RL 中档：再加上数学、代码、逻辑、科学", "rl_large": "RL 大档：题型和中档一样，题目另挑",
+    "eval_tasks": "评测题：每种题型留出一份，和 RL、SFT 都不重复", "mopd_prompts": "MOPD（多老师在线蒸馏）用的提示，只有问题",
+}
+# RL 每种题从哪来：RL_INPUTS 里的名字会换成上游数据集和许可，其余是写好的说明
+RL_SOURCES = {"数学": ["bigmath", "deepscaler", "gsm8k_zh"], "代码": ["deepcoder"], "科学": ["arc", "openscience"],
+              "指令跟随": ["ifeval", "SFT 留出的中文问题，配上中文约束"], "阅读": ["cmrc2018"], "逻辑": ["reasoning-gym 现场生成"],
+              "诗词": ["从诗词库出题（Werneror/Poetry，mit）"], "工具调用": ["程序生成；检索资料取自维基百科（cc-by-sa-3.0）"],
+              "通用": ["SFT 留出的问题（许可随来源）"], "写作": ["鲁迅作品续写（公有领域）"]}
+
+
+def _upstream(spec: dict) -> str:
+    how = spec.get("download", {})
+    return spec.get("upstream") or how.get("hf") or how.get("ms") or ""
+
+
+def posttrain_card(data_dir: Path = DATA) -> str:
+    """数据集说明的后训练部分：每个文件的条数和大小、SFT 每个来源的条数和许可、RL 每种题的来源。没有的文件不列。"""
+    files = [(n, data_dir / f"{n}.parquet") for n in POSTTRAIN_FILES if (data_dir / f"{n}.parquet").exists()]
+    if not files:
+        return ""
+    lines = ["## 后训练数据（`posttrain/`）", "",
+             "对话都在 `messages` 列：`[{role, content, tool_calls}, …]`，role 是 system、user、assistant、tool；工具调用是 JSON 字符串。"
+             "SFT 文件另有 `source`（来源）、`domain`（领域）、`license`（这条所属来源的许可）、`tokens`（真实长度）。"
+             "RL 和评测题另有 `reward`（判分方式）、`answer`、`tests` 等判分用的字段。", "",
+             "| 文件 | 条数 | 大小 | 内容 |", "|---|---|---|---|"]
+    for name, path in files:
+        meta = pq.ParquetFile(path).metadata
+        lines.append(f"| `posttrain/{name}.parquet` | {meta.num_rows:,} | {path.stat().st_size / 1e6:.0f} MB | {POSTTRAIN_FILES[name]} |")
+    biggest = next((p for n, p in reversed(files) if n.startswith("sft_") and "source" in pq.ParquetFile(p).schema_arrow.names
+                    and n in ("sft_small", "sft_medium", "sft_large")), None)
+    unclear = []
+    if biggest is not None:
+        t = pq.read_table(biggest, columns=["source", "license"])
+        counts, licences = {}, {}
+        for s, lic in zip(t.column("source").to_pylist(), t.column("license").to_pylist()):
+            counts[s] = counts.get(s, 0) + 1
+            licences.setdefault(s, lic)
+        lines += ["", f"### SFT 的来源（条数按 `{biggest.stem}`）", "", "| 来源 | 出自 | 许可 | 条数 | 备注 |", "|---|---|---|---|---|"]
+        for s, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            spec = SFT.get(s, {})
+            lines.append(f"| {s} | {_upstream(spec) or '本项目自制'} | {licences[s]} | {n:,} | {spec.get('note', '')} |")
+            if "待确认" in licences[s]:
+                unclear.append(s)
+    rl = next((p for n, p in reversed(files) if n.startswith("rl_")), None)
+    if rl is not None:
+        domains = {}
+        for d in pq.read_table(rl, columns=["domain"]).column("domain").to_pylist():
+            domains[d] = domains.get(d, 0) + 1
+        lines += ["", f"### RL 题目的来源（条数按 `{rl.stem}`）", "", "| 题型 | 条数 | 来源 |", "|---|---|---|"]
+        for d, n in sorted(domains.items(), key=lambda kv: -kv[1]):
+            parts = [f"{_upstream(RL_INPUTS[x])}（{RL_INPUTS[x]['license']}）" if x in RL_INPUTS else x for x in RL_SOURCES.get(d, ["本项目自制"])]
+            lines.append(f"| {d} | {n:,} | {'、'.join(parts)} |")
+    lines += ["", "### 后训练数据的许可", "",
+              "和预训练数据一样没有统一的许可：每条 SFT 的 `license` 列写着它所属来源的许可，RL 题目的来源和许可见上表。",
+              "- 备注里写着「由 GPT 生成」的来源，回答或解题过程是 OpenAI 的模型写的；它们自己的许可允许再分发，"
+              "但 OpenAI 的使用条款对用模型输出开发竞争模型有限制，使用前请自行判断，不需要的话按 `source` 列去掉；",
+              "- 评测基准 C-Eval、CMMLU（非商用许可）只在本地评测时下载，不在这个数据集里。"]
+    if unclear:
+        lines += ["", f"许可证待确认的来源：{'、'.join(unclear)}。上游没有写明许可，可能有版权风险，商用前请自行确认，或者按 `source` 列把它们去掉。"]
+    return "\n".join(lines) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="把洗好的来源混成最终数据集")
     parser.add_argument("command", choices=["index", "plan", "write", "verify", "card"])
@@ -454,7 +524,8 @@ def main(argv=None):
         for name, r in report.items():  # 早先的报告没有 source_tokens；verify 已经核对过每个来源的 token 数和计划一模一样，直接用计划的
             t = list(TIERS).index(name)
             r.setdefault("source_tokens", {s: row[t] for s, row in plan_table.items() if row[t]})
-        (out / "README.md").write_text(dataset_card(report), encoding="utf-8")
+        post = posttrain_card()
+        (out / "README.md").write_text(dataset_card(report) + ("\n" + post if post else ""), encoding="utf-8")
         print("数据集说明写到了", out / "README.md")
     else:
         report = verify_tiers(only=args.tiers)

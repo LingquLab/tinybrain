@@ -11,7 +11,7 @@
 
 处理（所有来源一样）：
   - 全部转成简体；
-  - 去掉自称是别家模型的回答（「我是 ChatGPT」「由 OpenAI 开发」这类），去掉空回答；
+  - 去掉自称是别家模型的回答（「我是 ChatGPT」「由 OpenAI 开发」「As an AI developed by OpenAI」这类），去掉空回答和没有提问的对话；
   - 推理过程：small 版去掉，只留回答；medium、large 版写成 <think>…</think> 放在回答前面；
   - 按正式分词器编出来的真实长度，按档截断：small 2048、medium 4096、large 8192；
   - 同一份语料里按第一个问题去重；
@@ -40,7 +40,11 @@ SMALL_KEEP = 0.5       # small 档每个外部来源留质量好的这么多
 EXPERTS = {"math": ("数学",), "code": ("代码",), "literature": ("文学",)}
 
 _OTHER_MODEL = re.compile(r"(?:我是|我叫|作为|身为)[^。\n]{0,8}(?:ChatGPT|GPT-?\d|Claude|通义千问|千问|Qwen|文心一言|Kimi|豆包|DeepSeek|深度求索|Gemini|Llama)"
-                          r"|由\s*(?:OpenAI|Anthropic|阿里巴巴|阿里云|百度|月之暗面|字节跳动|深度求索|Google|Meta)\s*(?:公司)?(?:开发|训练|创建|打造)", re.I)
+                          r"|由\s*(?:OpenAI|Anthropic|阿里巴巴|阿里云|百度|月之暗面|字节跳动|深度求索|Google|Meta)\s*(?:公司)?(?:开发|训练|创建|打造)"
+                          # 英文：只认说自己的句子（I am / I'm / As a(n) 开头），「GPT-4 is a model developed by OpenAI」这种讲事实的不算
+                          r"|\b(?:I am|I'm|As an?)\s[^.\n]{0,40}?\b(?:developed|created|trained|built|made)\s+by\s+"
+                          r"(?:OpenAI|Anthropic|Google|Meta|Alibaba|DeepSeek|Mistral|Microsoft)"
+                          r"|\b(?:I am|I'm)\s+(?:ChatGPT|GPT-?\d|Claude|Gemini|Llama|Qwen|Bard)\b", re.I)
 _TOOL_CALL_TEXT = re.compile(r"^\[(\w[\w\- ]*)\((.*)\)\]$", re.S)
 
 
@@ -139,7 +143,8 @@ def normalize(messages: list[dict], keep_reasoning: bool) -> list[dict] | None:
         if role == "tool" and sum(ch.isprintable() or ch in "\n\t" for ch in content) < 0.95 * max(1, len(content)):
             return None  # 工具返回里是二进制乱码
         out.append({"role": role, "content": content, "tool_calls": json.dumps(calls, ensure_ascii=False) if calls else None})
-    return out if any(m["role"] == "assistant" for m in out) else None
+    has_question = any(m["role"] == "user" and m["content"] for m in out)
+    return out if has_question and any(m["role"] == "assistant" for m in out) else None
 
 
 # ---------- 我们自己的数据：文学、自我认知
