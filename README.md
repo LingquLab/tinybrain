@@ -19,6 +19,7 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 
 ## 目录
 
+- [要花多少](#要花多少)
 - [快速开始](#快速开始)
 - [代码结构](#代码结构)
 - [模型](#模型)
@@ -26,6 +27,7 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 - [数据集：tinybrain dataset](#数据集tinybrain-dataset)
 - [预训练](#预训练)
 - [后训练](#后训练)
+- [N 卡训练：加速、Windows、监控](#n-卡训练加速windows监控)
 - [评测](#评测)
 - [推理](#推理)
 - [演示结果](#演示结果)
@@ -34,59 +36,83 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 
 ---
 
+## 要花多少
+
+| 硬件 | 模型 | 数据 | 预训练一遍 |
+|---|---|---|---|
+| RTX 5070 Ti 16GB | small（主干 6400 万参数，连词向量和记忆表共 1.67 亿） | nano（10 亿 token） | 约 4 小时 |
+| RTX 5070 Ti 16GB | small | mini（50 亿 token） | 约 20 小时 |
+| RTX 5070 Ti 16GB | small | base（202 亿 token） | 约 3.4 天 |
+| M4 Max | 演示模型（2300 万参数） | 9000 万 token，加上整套后训练 | 共 198 分钟 |
+
+5070 Ti 这几行是按实测的速度换算的：16 × 2048、约 7 万 token/秒（0.46–0.47 秒一步），显存峰值约 12.5 GiB，设置见[N 卡训练](#n-卡训练加速windows监控)。
+后训练的时间还没在显卡上量过。
+
+---
+
 ## 快速开始
+
+**第 0 步：装好**
 
 ```bash
 git clone https://github.com/cai114514114514/tinybrain && cd tinybrain
-pip install -e ".[data]"          # 要 Python 3.11+、PyTorch 2.5+（用 PyTorch 自带的 Muon 要 2.9+）
-pip install -e ".[fast]"          # 可选：切词改用 gigatoken，快一个数量级，结果一字节不差（Windows 上建议在 WSL 里装）
+pip install -e ".[data]"          # 要 Python 3.11+、PyTorch 2.5+（用 PyTorch 自带的 Muon 要 2.9+）；装完就有 tinybrain 命令
+pip install -e ".[cuda,fast]"     # 可选：N 卡训练加速（Liger）、快一个数量级的切词（gigatoken）；Windows 先看「N 卡训练」一节
 ```
 
-CUDA 训练加速使用 **Liger Kernel 0.8.5+**（融合输出层交叉熵、静态 mHC 读写、RMSNorm、RoPE、ReLU²）和 **PyTorch FlexAttention**（原生 GQA、滑动窗口）。Linux 可安装 `pip install -e ".[data,cuda]"`；Windows 先准备匹配 PyTorch 的 `triton-windows`，再安装 `pip install --no-deps liger-kernel==0.8.5`，避免 pip 拉取不支持 Windows 的标准 Triton 包。CPU 保留普通 PyTorch 实现。
-
-`python -m tools.bench small --batch 16 --seq 2048` 测完整的前向、反向和优化器更新；CUDA 默认使用选择性激活重计算，可用 `--checkpoint-policy full` 改为整层重算，或 `--no-checkpoint` 关闭重算。主干逐层编译，Engram 查表、流入口、出口和 Sinkhorn 也参与编译。mHC 使用 Liger 原有内核直接写入输入精度的缓冲区，减少 FP32 临时张量；内核内仍用 FP32 计算。预训练和 SFT 使用同一套融合损失与加速算子。
-
-预训练和 bench 可加 `--cuda-graph` 捕获融合 Adam 与自定义 Muon 的更新图，学习率保留在设备张量中逐步更新；检查点仍保存完整优化器状态。`--autotune` 搜索固定形状下的矩阵和注意力内核，首次编译较久。预训练默认每 50 步记录日志，可用 `--log-every` 修改。例如 `python -m training.train_pretrain --data data/tokens/base --out out/small/pretrain --preset small --seq-len 2048 --batch-size 16 --epochs 1 --cuda-graph --log-every 50`；从已有存档继续时加 `--resume`。
-
-CUDA 训练时把 Q、K、V 投影合并成一次矩阵乘法，参数和检查点中仍分别保存三组权重。验证和带缓存的生成保留原来的投影路径。
-
-Windows 默认编码为 GBK 时用 `python -X utf8 -m tools.bench small --batch 8 --seq 4096`。如果 Triton 默认缓存目录报路径错误，可在 PowerShell 中先设置 `$env:TRITON_CACHE_DIR = "$PWD\.cache\triton"` 和 `$env:TORCHINDUCTOR_CACHE_DIR = "$PWD\.cache\inductor"`。
-
-训练中也可以接入 TensorBoard：安装 `pip install -e ".[monitor]"`，运行 `python -m tools.tensorboard --run out/small/pretrain`，再运行 `python -m tensorboard.main --logdir out/small/pretrain/tensorboard --host 127.0.0.1 --port 6006`，打开 `http://127.0.0.1:6006`。同步工具会补录已有 JSONL 指标并持续追加训练/验证损失、各参数组学习率、吞吐和进度；不需要重启训练。历史数据的横轴使用训练步数。
-
-**1. 拿到数据**（二选一）
+**第 1 步：下数据**（[ModelScope](https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset)）
 
 ```bash
-# 直接下做好的（ModelScope：https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset ）
-modelscope download --dataset caiwangzsnm/tinybrain-dataset pretrain_mini.parquet --local_dir data
-
-# 或者自己从头做：下载 → 清洗 → 去重分档 → SFT 语料 → RL 题目
-python -m dataset.build --check   # 先看每一步要什么、有没有
-python -m dataset.build
+modelscope download --dataset caiwangzsnm/tinybrain-dataset pretrain_nano.parquet posttrain/sft_small.parquet --local_dir data
+mv data/posttrain/* data/
 ```
 
-**2. 预训练一个 small**
+也可以自己从头做：`tinybrain data --check` 先看每一步要什么，再 `tinybrain data`。
+
+**第 2 步：训练**。不用写路径：每个阶段写到 `out/small/<阶段>/`，下一个阶段自动从上一个阶段的存档出发；parquet 第一次用时自动切词。
 
 ```bash
-python -m tools.bench small --batch 4 --seq 4096                                          # 先量这张卡的速度和显存峰值，批大小按它定
-python -m tools.prepare --input data/pretrain_mini.parquet --out data/tokens/mini        # 切词
-python -m training.train_pretrain --data data/tokens/mini --out out/small/pretrain \
-    --preset small --seq-len 2048 --batch-size 16 --epochs 1                              # 中断后加 --resume 接着跑
+tinybrain pretrain        # 预训练：data/pretrain_nano.parquet → out/small/pretrain
+tinybrain sft             # SFT：data/sft_small.parquet，从上一步出发 → out/small/sft
 ```
 
-显存不够就把 `--batch-size` 减半、`--grad-accum` 加倍，等效的批大小不变。
-
-**3. 后训练，然后聊两句**
+**第 3 步：看效果**
 
 ```bash
-python -m tools.prepare --chat --input data/sft_small.parquet --out data/tokens/sft-small --seq-len 2048
-python -m training.train_sft --init out/small/pretrain/ckpt.pt --data data/tokens/sft-small --out out/small/sft --epochs 2
-python -m training.train_rl --init out/small/sft/ckpt.pt --tasks data/rl_small.parquet --out out/small/rl \
-    --judge-url http://localhost:8000/v1                                                   # 评审模型的接口，见「RLAIF」
-python -m inference.chat out/small/rl/ckpt.pt --tools
+tinybrain generate        # 预训练完：续写几个内置的开头
+tinybrain chat --demo     # SFT 完：把内置的 8 个问题挨个问一遍
+tinybrain chat            # 自己聊（--tools 打开计算器和 Python）
 ```
 
-**只想看看整条链能不能跑**：`python -m tools.demo` 在一个 2300 万参数的小模型上把所有阶段跑一遍（M4 Max 上约 3.3 小时）。
+- 换更大的数据：`--data data/pretrain_mini.parquet`；换尺寸：`--preset medium`（写到 `out/medium/`）。
+- 显存不够：`--batch-size 8 --grad-accum 2`，等效的批大小不变；中断了加 `--resume` 接着跑。
+- 日志每行都有损失、梯度范数、速度和剩余时间；想看曲线用 `tinybrain tensorboard`（见「N 卡训练」一节）。
+- 其余阶段（退火、领域专家、MOPD、RL）见[后训练](#后训练)。
+- 只想看整条链能不能跑：`tinybrain demo` 在一个 2300 万参数的小模型上把所有阶段跑一遍（M4 Max 上约 3.3 小时）。
+- 没装成命令也没关系：`tinybrain pretrain` 就是 `python -m training.train_pretrain`，每个命令对应的模块见 `tools/cli.py`。
+
+**全部命令**（`tinybrain <命令> --help` 看全部参数）
+
+```
+tinybrain data         做数据：下载、清洗、去重分档、SFT 语料、RL 题目（--check 先看缺什么）
+tinybrain prepare      切词；训练时给 parquet 会自动切，一般不用单独跑
+tinybrain tokenizer    抽样本、训练、评测分词器，导出 HF 格式
+tinybrain pretrain     预训练，也用来退火
+tinybrain sft          SFT：通用和领域专家
+tinybrain distill      MOPD：多老师在线蒸馏
+tinybrain rl           强化学习（GRPO）：RLVR、agent RL、RLAIF
+tinybrain generate     续写：看预训练模型学到了什么
+tinybrain chat         命令行对话（--demo 把内置的问题问一遍）
+tinybrain serve        OpenAI 兼容的服务
+tinybrain eval         评测：留出集损失、各题型正确率、评审打分
+tinybrain benchmarks   C-Eval、CMMLU、GSM8K
+tinybrain bench        测这张卡的训练速度和显存
+tinybrain report       参数量报告
+tinybrain overfit      过拟合检查：在一小批数据上把损失训到接近 0
+tinybrain demo         在一个 2300 万参数的小模型上把整条链跑一遍
+tinybrain tensorboard  把训练日志同步成 TensorBoard
+tinybrain judge-check  检查评审模型打分靠不靠谱
+```
 
 ---
 
@@ -105,12 +131,15 @@ lm/                    模型的定义，只有模型（一个文件一个概念
     streams.py             多条流的入口和出口（用注意力）
     block.py               一层 = 记忆注入 + 注意力 + 前馈
     norm.py / rotary.py    归一化、位置编码
+  loss.py                输出层加交叉熵（CUDA 上用 Liger 的融合内核，否则分块算）
+  checkpointing.py       逐层激活重计算
 training/              训练；每个阶段一个脚本，从头读到尾就是这个阶段的全部，参数都在文件末尾的 parse_args 里
   train_pretrain.py      预训练（也用于退火：--init 从存档出发，--data 按比例混合几份数据）
   train_sft.py           SFT：只在回答上算损失（通用 SFT 和领域专家都用它）
   train_distill.py       MOPD：多老师在线蒸馏，按领域路由到老师
   train_rl.py            GRPO（Dr. GRPO）：RLVR、agent RL、RLAIF 共用
-  trainer_utils.py       共用的：设备和混合精度、学习率曲线、优化器、存档
+  trainer_utils.py       共用的：设备和混合精度、学习率曲线、优化器、梯度裁剪、存档、运行目录（各阶段之间怎么衔接）
+  cuda_graph.py          可选：把优化器的更新录成 CUDA graph
   dataset.py             训练数据的读写（预训练的长串、打包好的对话、按比例混合）
   muon.py                自己写的 Muon（另一条路径是 PyTorch 自带的，--optimizer native）
   rollout.py             采样一组回答、带工具的多轮对话
@@ -126,10 +155,11 @@ dataset/               数据流水线（tinybrain dataset）
   sft.py                 SFT 语料
   rl.py                  RL 题目、评测题、MOPD 提示
   build.py               总入口：按顺序跑各步，开跑前检查输入
-tools/                 辅助工具：参数量报告、测速、训练分词器、切词、过拟合检查、整条链演示、评审模型检查
-tokenizer/             正式分词器（tokenizer.model、tokenizer.vocab）
+tools/                 辅助工具：tinybrain 命令（cli.py）、参数量报告、测速、训练分词器、切词、过拟合检查、整条链演示、评审模型检查、TensorBoard 同步
+tokenizer/             正式分词器（tokenizer.model、tokenizer.vocab；tokenizer.json 是逐词一致的 HF 格式，给 gigatoken 用）
 docs/                  设计文档：post-training.md（后训练流程）、rlaif-rubric.md（评审的评分细则）
-data/                  数据（不进仓库）：raw 原始下载、clean 洗好的、inputs 后训练原料、*.parquet 成品
+data/                  数据（不进仓库）：raw 原始下载、clean 洗好的、inputs 后训练原料、*.parquet 成品、tokens/ 切好的词
+out/                   训练输出（不进仓库）：out/<尺寸>/<阶段>/ 下有 ckpt.pt、log.jsonl、config.json
 ```
 
 ---
@@ -195,7 +225,7 @@ $$
 g_s = \sigma\!\left(\frac{\langle \text{RMSNorm}(X_s),\ \text{RMSNorm}(K_s\,e)\rangle}{\sqrt{d}}\right),\qquad X_s \leftarrow X_s + g_s \cdot V e
 $$
 
-记忆表查一次只取十几行，**不花算力，只占显存**。所以三档的记忆表都做得很大：统一占「主干 + 记忆表」参数的 45%（`ENGRAM_SHARE`）。代码：`lm/layers/engram.py`。
+记忆表查一次只取十几行，**不花算力，只占显存**。所以记忆表都做得很大：small、medium 占「主干 + 记忆表」参数的 45%（`ENGRAM_SHARE`）；large 是 MoE，按 Engram 论文的最优点，占「每个词用不到的参数」的 25%（`ENGRAM_SPARSE_SHARE`）。代码：`lm/layers/engram.py`。
 
 ### 流的入口和出口
 
@@ -209,7 +239,7 @@ $$
 - **分组查询注意力（GQA）**：small 有 12 个查询头、3 组键值头，键值缓存小到四分之一；
 - **QK 归一化**：查询和键先过 RMSNorm 再做点积，训练更稳；
 - **旋转位置编码（RoPE）**，底数 10000，上下文 8192；
-- **滑动窗口 3:1**：每 4 层里前 3 层只看最近 1024 个词，第 4 层（以及最后一层）看全文。窗口层按块算——把序列切成 1024 长的块，每块的查询只和「上一块 + 本块」的键算，计算量从 $T^2$ 降到 $2WT$，结果和逐位置加掩码完全一样。
+- **滑动窗口 3:1**：每 4 层里前 3 层只看最近 1024 个词，第 4 层（以及最后一层）看全文。CUDA 上用 FlexAttention：窗口和因果写成一条掩码规则，编成块稀疏的掩码，只算窗口里的那条带子，计算量从 $T^2$ 降到约 $WT$，原生支持分组查询；CPU、MPS 上用带掩码的 scaled_dot_product_attention，结果一样。
 
 代码：`lm/layers/attention.py`。
 
@@ -217,7 +247,7 @@ $$
 
 普通前馈层用 ReLU²：$\text{FFN}(x) = W_2\,\text{ReLU}(W_1 x)^2$，中间宽度 4d。
 
-large 档换成混合专家：一个整宽的**共享专家**，加上从 24 个四分之一宽的专家里选 8 个：
+large 档换成混合专家：第 1 层仍是普通前馈；其余各层是 2 个**共享专家**（和路由专家同宽，合起来就是一个半宽的前馈层），加上从 48 个四分之一宽的路由专家里选 8 个。按宽度算，每个词用到全部专家的 20%：
 
 $$
 s = \sqrt{\operatorname{softplus}(W_r z)},\qquad \mathcal{K} = \operatorname{top\text{-}k}(s + b),\qquad y = \text{FFN}_{\text{shared}}(x) + \sum_{e \in \mathcal{K}} \frac{s_e}{\sum_{e' \in \mathcal{K}} s_{e'}}\,\text{FFN}_e(z)
@@ -228,6 +258,8 @@ $$
 - **很轻的均衡损失**：$\mathcal{L}_{\text{bal}} = E \sum_e \text{load}_e \cdot \text{share}_e$，权重 $10^{-4}$。$\text{load}_e$ 是专家实际接了多大比例的词，$\text{share}_e$ 是它平均拿到多大比例的分数。
 
 可选 LatentMoE：先把输入压到更窄的宽度，路由和专家都在压缩后的空间里算，最后再升回来。代码：`lm/layers/moe.py`。
+
+**为什么这么配**（对照了 20 个公开 MoE 的配置）：2024 年以后的 MoE 激活比例几乎都在 12.5% 以下，和我们尺寸接近的小 MoE 用 32–64 个专家（Granite-1B 是 32 选 8、OLMoE 是 64 选 8）；专家宽度多是模型宽度的 0.25–0.5 倍；DeepSeek、Kimi、GLM、Moonlight 让第 1 层保持普通前馈、配一两个窄的共享专家（Qwen3、OLMoE、Granite 不用共享专家，这一点没有共识）。蚂蚁的效率杠杆论文给出的最优粒度 $2d/w$ 在 8–12，我们是 8。记忆表的大小也跟着 MoE 走：Engram 论文发现，每个词用不到的参数（没选中的专家 + 记忆表）里，记忆表占 20–25% 最好，large 取 25%。
 
 ### 其他细节
 
@@ -241,9 +273,9 @@ $$
 |---|---|---|---|---|---|
 | small | 768 × 10 | 64M | 53M（每个哈希约 10 万行 × 宽 32） | 50M | 167M |
 | medium | 1152 × 16 | 233M | 190M（约 25 万行 × 宽 48） | 75M | 499M |
-| large | 1280 × 20 | 556M（每个词用到 294M） | 455M（约 44 万行 × 宽 64） | 84M | 1.09B |
+| large | 1280 × 20 | 889M（每个词用到 266M） | 207M（约 20 万行 × 宽 64，占每个词用不到的参数的 25%） | 84M | 1.18B |
 
-large 的前馈层是 24 选 8 的四分之一宽专家加一个整宽的共享专家。`python -m tools.report small` 打印每个部件的参数量。
+large 的前馈层：第 1 层普通前馈，其余各层 48 选 8 的四分之一宽专家加 2 个同宽的共享专家。`tinybrain report large` 打印每个部件的参数量。
 
 ---
 
@@ -261,9 +293,9 @@ large 的前馈层是 24 选 8 的四分之一宽专家加一个整宽的共享�
 | 1.70 | 2.16 | 1.11 | 2.84 | 3.09 | 3.40 | 4.16 | 2.38 |
 
 ```bash
-python -m tools.tokenizer sample --tokens 40000000      # 重新抽样本
-python -m tools.tokenizer train --vocab 32768           # 重新训练
-python -m tools.tokenizer eval tokenizer/tokenizer.model
+tinybrain tokenizer sample --tokens 40000000      # 重新抽样本
+tinybrain tokenizer train --vocab 32768           # 重新训练
+tinybrain tokenizer eval tokenizer/tokenizer.model
 ```
 
 ---
@@ -312,7 +344,7 @@ nano、mini、base 严格按下面的配比挑（按真实 token 算）；full �
 混合数据集没有统一的许可证：每篇文档带着 `license` 列，写的是它所属来源的许可证。维基百科、维基文库是 CC BY-SA 3.0（署名、相同方式共享）；百度百科和 shu 的上游没写清楚许可证，标成「待确认」，商用前请自行确认，或者按 `source` 列去掉。
 
 ```bash
-python -m dataset.build --check              # 每一步要什么、有没有、会产出什么
+tinybrain data --check              # 每一步要什么、有没有、会产出什么
 python -m dataset.download wiki_zh --list    # 某个来源会下哪些文件
 python -m dataset.pretrain audit wiki_zh     # 抽查洗出来的结果：随机看几篇、最常重复的行、可疑痕迹
 ```
@@ -322,9 +354,9 @@ python -m dataset.pretrain audit wiki_zh     # 抽查洗出来的结果：随机
 ## 预训练
 
 ```bash
-python -m tools.prepare --input data/pretrain_mini.parquet --out data/tokens/mini
-python -m training.train_pretrain --data data/tokens/mini --out out/small/pretrain --preset small --seq-len 4096 --batch-size 8 --epochs 1
-python -m training.train_pretrain --help     # 全部参数：模型（--dim、--n-layers……）、各组学习率、记录和存档
+tinybrain pretrain                                        # 默认：small，data/pretrain_nano.parquet → out/small/pretrain
+tinybrain pretrain --data data/pretrain_mini.parquet --seq-len 2048 --batch-size 16
+tinybrain pretrain --help     # 全部参数：模型（--dim、--n-layers……）、各组学习率、梯度裁剪、记录和存档
 ```
 
 ### 损失
@@ -394,7 +426,16 @@ medium/large ：预训练(base / full) → 退火 → SFT → 领域专家（数
 每档都能单独跑通，不依赖别的尺寸。完整的设计和取舍见 [docs/post-training.md](docs/post-training.md)。
 
 ```bash
-python -m dataset.build sft rl       # 后训练数据：SFT 语料、RL 题目、评测题、MOPD 提示
+tinybrain data sft rl       # 后训练数据：SFT 语料、RL 题目、评测题、MOPD 提示（也可以从 ModelScope 的 posttrain/ 下载）
+```
+
+各阶段都写到同一个运行目录（默认 `out/small`，换尺寸用 `--run out/medium`），不写 `--init` 时自动从上一个阶段的存档出发：
+
+```bash
+tinybrain sft                                            # SFT：从退火（没有就预训练）出发 → out/small/sft
+tinybrain sft --data data/sft_expert_math.parquet        # 领域专家 → out/small/expert_math（代码、文学同理）
+tinybrain distill                                        # MOPD：学生是 sft，老师是所有 expert_<领域> → out/small/mopd
+tinybrain rl --judge-url http://localhost:8000/v1        # RL：从 sft 出发，data/rl_small.parquet → out/small/rl
 ```
 
 ### 退火
@@ -402,8 +443,8 @@ python -m dataset.build sft rl       # 后训练数据：SFT 语料、RL 题目�
 预训练最后一段（默认最后 10% 的步数）换数据接着训：九成预训练数据 + 一成对话格式的数据（整段都算损失），学习率从 0.1 倍降到 0。用的还是 `train_pretrain.py`：
 
 ```bash
-python -m training.train_pretrain --init out/small/pretrain/ckpt.pt --data data/tokens/mini:0.9,data/tokens/chat-all:0.1 \
-    --out out/small/anneal --epochs 0.1 --warmup-steps 0 --lr-mult 0.1 --final-lr-frac 0
+tinybrain pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_mini.parquet:0.9,data/tokens/chat-all:0.1 \
+    --epochs 0.1 --warmup-steps 0 --lr-mult 0.1 --final-lr-frac 0          # 给了 --init 默认写到 out/small/anneal
 ```
 
 ### SFT
@@ -494,18 +535,36 @@ RLVR、agent RL、RLAIF 用的是同一个训练器，区别只在题目和奖�
 
 **格律分**（`training/rewards/poetry.py`）：句数、每句字数要对，否则 0；对了以后 $r_{\text{格律}} = 0.3 + 0.35\,r_{\text{押韵}} + 0.35\,r_{\text{平仄}}$。押韵看偶数句末字是否同韵且平声；平仄按「一三五不论，二四六分明」，在仄起、平起两种格式里取对得更好的。平仄和韵部用 pypinyin 按普通话近似，入声字会判错（这是已知的简化）。
 
-**RLAIF 的评审模型**：Qwen3.8-27B（Apache-2.0），按中文评分细则（`docs/rlaif-rubric.md`：通用、写作、古文、诗词四个领域）打 1–10 分，不开思考模式。显卡上用 vLLM 跑 FP8 版，Mac 上用 `mlx_lm.server` 跑 4-bit 版（一次只算一个请求，要加 `--judge-workers 1`）。`python -m tools.judge_check` 用好回答和故意弄坏的回答（截断、答非所问、车轱辘话、诗的字序打乱）检查评审分不分得清好坏。
+**RLAIF 的评审模型**：Qwen3.8-27B（Apache-2.0），按中文评分细则（`docs/rlaif-rubric.md`：通用、写作、古文、诗词四个领域）打 1–10 分，不开思考模式。显卡上用 vLLM 跑 FP8 版，Mac 上用 `mlx_lm.server` 跑 4-bit 版（一次只算一个请求，要加 `--judge-workers 1`）。`tinybrain judge-check` 用好回答和故意弄坏的回答（截断、答非所问、车轱辘话、诗的字序打乱）检查评审分不分得清好坏。
 
 题目和评测题由 `dataset/rl.py` 生成：每种题先留出一份当评测题，和 RL 题、SFT 都不重复。
+
+---
+
+## N 卡训练：加速、Windows、监控
+
+在 RTX 5070 Ti 16GB 上验证过：small、2048 × 16，约 7 万 token/秒（0.46–0.47 秒一步），进程专用显存峰值约 12.5 GiB。CPU 和 MPS 上走普通的 PyTorch 实现，结果一样（有测试对照）。
+
+CUDA 训练加速使用 **Liger Kernel 0.8.5+**（融合输出层交叉熵、静态 mHC 读写、RMSNorm、RoPE、ReLU²）和 **PyTorch FlexAttention**（原生 GQA、滑动窗口）。Linux 可安装 `pip install -e ".[data,cuda]"`；Windows 先准备匹配 PyTorch 的 `triton-windows`，再安装 `pip install --no-deps liger-kernel==0.8.5`，避免 pip 拉取不支持 Windows 的标准 Triton 包。CPU 保留普通 PyTorch 实现。
+
+`tinybrain bench small --batch 16 --seq 2048` 测完整的前向、反向和优化器更新；CUDA 默认使用选择性激活重计算，可用 `--checkpoint-policy full` 改为整层重算，或 `--no-checkpoint` 关闭重算。主干逐层编译，Engram 查表、流入口、出口和 Sinkhorn 也参与编译。mHC 使用 Liger 原有内核直接写入输入精度的缓冲区，减少 FP32 临时张量；内核内仍用 FP32 计算。预训练和 SFT 使用同一套融合损失与加速算子。
+
+预训练和 bench 可加 `--cuda-graph` 捕获融合 Adam 与自定义 Muon 的更新图，学习率保留在设备张量中逐步更新；检查点仍保存完整优化器状态。`--autotune` 搜索固定形状下的矩阵和注意力内核，首次编译较久。预训练默认每 50 步记录日志，可用 `--log-every` 修改。例如 `tinybrain pretrain --data data/tokens/base --out out/small/pretrain --preset small --seq-len 2048 --batch-size 16 --epochs 1 --cuda-graph --log-every 50`；从已有存档继续时加 `--resume`。
+
+CUDA 训练时把 Q、K、V 投影合并成一次矩阵乘法，参数和检查点中仍分别保存三组权重。验证和带缓存的生成保留原来的投影路径。
+
+Windows 默认编码为 GBK 时，先设 `$env:PYTHONUTF8 = 1`（PowerShell）再运行 `tinybrain …`，或者用 `python -X utf8 -m tools.bench small --batch 8 --seq 4096`。如果 Triton 默认缓存目录报路径错误，可在 PowerShell 中先设置 `$env:TRITON_CACHE_DIR = "$PWD\.cache\triton"` 和 `$env:TORCHINDUCTOR_CACHE_DIR = "$PWD\.cache\inductor"`。
+
+训练中也可以接入 TensorBoard：安装 `pip install -e ".[monitor]"`，运行 `tinybrain tensorboard --run out/small/pretrain`，再运行 `python -m tensorboard.main --logdir out/small/pretrain/tensorboard --host 127.0.0.1 --port 6006`，打开 `http://127.0.0.1:6006`。同步工具会补录已有 JSONL 指标并持续追加训练/验证损失、各参数组学习率、吞吐和进度；不需要重启训练。历史数据的横轴使用训练步数。
 
 ---
 
 ## 评测
 
 ```bash
-python -m eval.benchmarks prepare                                             # 下载 C-Eval、CMMLU、GSM8K（只在本地评测用）
-python -m eval.suite out/small/rl/ckpt.pt --tasks data/eval_tasks.parquet --bench ceval cmmlu gsm8k --judge-url …
-python -m eval.benchmarks run out/small/pretrain/ckpt.pt --shots 5            # 基座模型：不套对话格式，带例题
+tinybrain benchmarks prepare                                             # 下载 C-Eval、CMMLU、GSM8K（只在本地评测用）
+tinybrain eval out/small/rl/ckpt.pt --tasks data/eval_tasks.parquet --bench ceval cmmlu gsm8k --judge-url …
+tinybrain benchmarks run out/small/pretrain/ckpt.pt --shots 5            # 基座模型：不套对话格式，带例题
 ```
 
 - **留出集损失**：按类别（中文、百科、代码、数学、古文……）看后训练有没有把预训练学到的东西训坏；
@@ -520,8 +579,8 @@ C-Eval 是 CC BY-NC-SA 4.0、CMMLU 是 CC BY-NC 4.0，只下载到本地评测�
 ## 推理
 
 ```bash
-python -m inference.chat out/small/rl/ckpt.pt --tools     # 命令行对话，--tools 打开计算器和 Python
-python -m inference.serve out/small/rl/ckpt.pt --port 8001  # OpenAI 兼容的 /v1/chat/completions，支持工具调用
+tinybrain chat --tools                         # 命令行对话：默认用 out/small 里走得最远的存档；--tools 打开计算器和 Python
+tinybrain serve out/small/rl/ckpt.pt --port 8001  # OpenAI 兼容的 /v1/chat/completions，支持工具调用
 ```
 
 CUDA 上生成走静态缓存：键值缓存按最大长度预先分配，每一步原地写入，形状完全固定，整步用 `torch.compile(mode="reduce-overhead")` 录成 CUDA graph（gpt-fast 的做法）。CPU、MPS 上走普通的带缓存生成，两条路径结果一样（有测试对照）。
@@ -549,7 +608,7 @@ CUDA 上生成走静态缓存：键值缓存按最大长度预先分配，每一
 
 ## 还没做的
 
-- 在显卡上正式训练 small、medium、large，测训练时间和能力；
+- small 正在 RTX 5070 Ti 上预训练，训完补上样例对话和评测分数；medium、large 还没训；
 - 评分细则和人工打分对比校准；
 - 古文、诗词的专门评测；MMLU、MATH-500、HumanEval、MBPP、IFEval 这些基准；
 - large 接小米开源的 MiMo agent 环境（通过 `inference/serve.py` 的 OpenAI 兼容接口）；
