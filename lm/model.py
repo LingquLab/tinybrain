@@ -102,8 +102,8 @@ class LanguageModel(nn.Module):
         maps = self.hyper.mappings(x.dtype)
         balance = x.new_zeros((), dtype=torch.float32)
         for i, block in enumerate(self.blocks):
-            # MoE 前向会更新路由偏置，不能直接重算；带生成缓存时也不能重算。
-            if self.gradient_checkpointing and self.training and torch.is_grad_enabled() and state is None and not self.cfg.moe_experts:
+            # 带生成缓存时不能重算。MoE 的路由偏置不在前向里改（见 lm/layers/moe.py），重算时挑的专家不变，可以照常重算。
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled() and state is None:
                 layer_maps = tuple(m[2 * i:2 * i + 2] for m in maps)
                 x, b = self.checkpoint_block(block, x, cos, sin, layer_maps, memory, self.checkpoint_policy)
             else:
@@ -126,6 +126,12 @@ class LanguageModel(nn.Module):
                 past = state.history if state.history is not None else idx.new_full((B, self.memory.history_len), self.memory.pad_id)
                 state.history = torch.cat([past, idx], dim=1)[:, -self.memory.history_len:]
         return Output(logits, loss, balance)
+
+    def update_balance(self) -> None:
+        """MoE：按这一步记下的负载调一次各层的路由偏置。build_optimizers 把它挂在 Muon 每一步之后，训练脚本不用自己调。"""
+        for module in self.modules():
+            if hasattr(module, "apply_balance"):
+                module.apply_balance()
 
     def new_state(self) -> DecodeState:
         return DecodeState(self.cfg.n_layers)

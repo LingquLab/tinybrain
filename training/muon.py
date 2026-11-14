@@ -21,8 +21,11 @@ def orthogonalize(g: torch.Tensor, steps: int = 5) -> torch.Tensor:
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, nesterov: bool = True, ns_steps: int = 5, weight_decay: float = 0.0):
+    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95, nesterov: bool = True, ns_steps: int = 5, weight_decay: float = 0.0,
+                 momentum_dtype: torch.dtype | None = None):
+        """momentum_dtype：动量用什么精度存，默认和梯度一样；显存紧时用 torch.bfloat16，省一半。"""
         super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay))
+        self.momentum_dtype = momentum_dtype
         for group in self.param_groups:
             if any(p.ndim < 2 for p in group["params"]):
                 raise ValueError("Muon 只能用于二维以上的参数")
@@ -43,9 +46,10 @@ class Muon(torch.optim.Optimizer):
                 key = (shape, len(params))
                 buf = self.state[params[0]].get(key)
                 if buf is None:
-                    buf = self.state[params[0]][key] = torch.zeros_like(grads)
-                buf.lerp_(grads, 1 - group["momentum"])
-                update = grads.lerp(buf, group["momentum"]) if group["nesterov"] else buf
+                    buf = self.state[params[0]][key] = torch.zeros_like(grads, dtype=self.momentum_dtype or grads.dtype)
+                buf.lerp_(grads.to(buf.dtype), 1 - group["momentum"])
+                momentum = buf.to(grads.dtype)
+                update = grads.lerp(momentum, group["momentum"]) if group["nesterov"] else momentum
                 half = update.is_cuda  # CUDA 上用半精度算正交化：快，而且只要方向大致对就行
                 update = orthogonalize(update.bfloat16() if half else update, group["ns_steps"]).to(grads.dtype)
                 scale = max(1.0, shape[-2] / shape[-1]) ** 0.5

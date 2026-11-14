@@ -136,25 +136,43 @@ def split_parameters(model: LanguageModel) -> dict[str, list]:
 
 def build_optimizers(model: LanguageModel, kind: str = "custom", matrix_lr: float = 0.02, embed_lr: float = 0.3, head_lr: float = 0.004,
                      engram_lr: float = 0.3, scalar_lr: float = 0.01, weight_decay: float = 0.0, momentum: float = 0.95,
-                     adam_betas: tuple = (0.8, 0.95), adam_eps: float = 1e-10) -> list[torch.optim.Optimizer]:
+                     adam_betas: tuple = (0.8, 0.95), adam_eps: float = 1e-10, muon_momentum_dtype: torch.dtype | None = None,
+                     offload_adam: bool = False) -> list[torch.optim.Optimizer]:
     """返回 [Adam, Muon]，每个参数恰好归一组。Adam 那几组的学习率按 (dim/768)^-0.5 缩放；权重衰减只作用在矩阵上。
-    每组记下 base_lr，学习率调度按比例缩放它。这些学习率都是起步值，还没有在我们的数据上调过。"""
+    每组记下 base_lr，学习率调度按比例缩放它。这些学习率都是起步值，还没有在我们的数据上调过。
+
+    显存紧时（比如 16 GB 的卡训 large）：muon_momentum_dtype=torch.bfloat16 让 Muon 的动量省一半；
+    offload_adam=True 把 Adam 管的那几组（词向量、输出层、记忆表……）的状态放到 CPU 上、在 CPU 上更新（torchao 的 CPUOffloadOptimizer），
+    显存里只留参数和梯度。有 MoE 时，Muon 每走一步会顺带调一次路由偏置（model.update_balance）。"""
     if kind not in MUON_KINDS:
         raise ValueError(f"没有 {kind!r} 这种 Muon 路径，可选：{'、'.join(MUON_KINDS)}")
     groups = split_parameters(model)
     scale = (model.cfg.dim / 768) ** -0.5
     spec = [("embed", embed_lr), ("head", head_lr), ("engram", engram_lr), ("scalar", scalar_lr)]
     on_cuda = next(model.parameters()).is_cuda  # CUDA 上用融合版的 Adam：一次调用更新所有参数
-    adam = torch.optim.Adam([dict(params=groups[k], lr=lr * scale, name=k) for k, lr in spec if groups[k]],
-                            betas=adam_betas, eps=adam_eps, weight_decay=0.0, fused=on_cuda)
+    adam_groups = [dict(params=groups[k], lr=lr * scale, name=k) for k, lr in spec if groups[k]]
+    if offload_adam:
+        if not on_cuda:
+            raise RuntimeError("--offload-adam 只在 CUDA 上用：把 Adam 的状态从显存挪到 CPU")
+        try:
+            from torchao.optim import CPUOffloadOptimizer
+        except ImportError:
+            raise RuntimeError("--offload-adam 要装 torchao：pip install torchao") from None
+        adam = CPUOffloadOptimizer(adam_groups, torch.optim.Adam, betas=adam_betas, eps=adam_eps, weight_decay=0.0)
+    else:
+        adam = torch.optim.Adam(adam_groups, betas=adam_betas, eps=adam_eps, weight_decay=0.0, fused=on_cuda)
     matrices = [dict(params=groups["matrix"], name="matrix")]
     if kind == "native":
+        if muon_momentum_dtype is not None:
+            raise ValueError("PyTorch 自带的 Muon 不能改动量的精度；要省显存用 --optimizer custom")
         if not hasattr(torch.optim, "Muon"):
             raise RuntimeError(f"这版 PyTorch（{torch.__version__}）没有自带的 Muon，要 2.9 以上；或者用 --optimizer custom")
         muon = torch.optim.Muon(matrices, lr=matrix_lr, momentum=momentum, weight_decay=weight_decay, nesterov=True, ns_steps=5,
                                 adjust_lr_fn="original")
     else:
-        muon = Muon(matrices, lr=matrix_lr, momentum=momentum, weight_decay=weight_decay)
+        muon = Muon(matrices, lr=matrix_lr, momentum=momentum, weight_decay=weight_decay, momentum_dtype=muon_momentum_dtype)
+    if getattr(model.cfg, "moe_experts", 0):
+        muon.register_step_post_hook(lambda optimizer, args, kwargs: model.update_balance())
     optimizers = [adam, muon]
     for opt in optimizers:
         for group in opt.param_groups:
@@ -174,11 +192,14 @@ def add_optimizer_args(parser, lr_mult: float = 1.0) -> None:
     g.add_argument("--scalar-lr", type=float, default=0.01, help="归一化系数、多流残差系数、流入口出口的查询向量")
     g.add_argument("--weight-decay", type=float, default=0.0, help="只作用在 Muon 管的矩阵上")
     g.add_argument("--clip-grad", type=float, default=1.0, help="梯度裁剪：所有梯度合起来的范数超过它就按比例缩小；0 表示不裁剪")
+    g.add_argument("--muon-momentum", choices=["float32", "bfloat16"], default="float32", help="Muon 动量的精度；bfloat16 省一半显存")
+    g.add_argument("--offload-adam", action="store_true", help="Adam 那几组的状态放到 CPU 上（要 CUDA 和 torchao），显存紧时用")
 
 
 def optimizers_from_args(model: LanguageModel, args) -> list[torch.optim.Optimizer]:
     return build_optimizers(model, args.optimizer, matrix_lr=args.matrix_lr, embed_lr=args.embed_lr, head_lr=args.head_lr,
-                            engram_lr=args.engram_lr, scalar_lr=args.scalar_lr, weight_decay=args.weight_decay)
+                            engram_lr=args.engram_lr, scalar_lr=args.scalar_lr, weight_decay=args.weight_decay,
+                            muon_momentum_dtype=torch.bfloat16 if args.muon_momentum == "bfloat16" else None, offload_adam=args.offload_adam)
 
 
 def clip_gradients(params, max_norm: float) -> torch.Tensor | None:

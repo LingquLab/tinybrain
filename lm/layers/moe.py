@@ -3,7 +3,8 @@
 每个词由一个所有词共用的「共享专家」加上从 E 个专家里挑出的 top-k 个来处理。
   打分：sqrt(softplus(线性))，非负；选中的 k 个分数归一后当权重。
   均衡：每个专家有一个不参与求导的偏置，只在「挑谁」时加上——哪个专家活儿多就把它的偏置调低一点；
-        另外返回一个很轻的均衡损失。
+        另外返回一个很轻的均衡损失。偏置不在前向里改：前向只记下这一批的负载，优化器走完一步再由 apply_balance 调一次。
+        这样激活重计算把前向再跑一遍时，挑出来的专家和第一次一模一样，梯度才对。
   LatentMoE：moe_latent_dim 大于 0 时，先把输入压到这个宽度，路由和专家都在压缩后的空间里算，最后再升回来。
 """
 import torch
@@ -27,6 +28,7 @@ class MoE(nn.Module):
         self.w_in = nn.ParameterList(nn.Parameter(torch.empty(hidden, width)) for _ in range(n_experts))
         self.w_out = nn.ParameterList(nn.Parameter(torch.zeros(width, hidden)) for _ in range(n_experts))
         self.register_buffer("balance_bias", torch.zeros(n_experts))
+        self.pending_load = None  # 最近一次训练前向记下的负载，等 apply_balance 用
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """返回 (输出, 均衡损失)。"""
@@ -56,8 +58,14 @@ class MoE(nn.Module):
 
         load = counts.float() / (N * k)  # 每个专家实际接了多大比例的活，均衡时是 1/E
         if self.training:
-            with torch.no_grad():
-                self.balance_bias += self.balance_rate * torch.sign(1.0 / E - load)
+            self.pending_load = load.detach()  # 重计算时同一批再跑一遍，记下的是同样的负载
         share = (scores / (scores.sum(-1, keepdim=True) + 1e-9)).mean(0)  # 每个专家平均拿到多大比例的分数
         balance_loss = E * (load * share).sum()
         return self.shared(x) + y.view(shape), balance_loss
+
+    @torch.no_grad()
+    def apply_balance(self) -> None:
+        """按最近一次训练前向的负载调一次偏置：活儿多的专家偏置降一点。每个优化器步调用一次（见 LanguageModel.update_balance）。"""
+        if self.pending_load is not None:
+            self.balance_bias += self.balance_rate * torch.sign(1.0 / self.n_experts - self.pending_load)
+            self.pending_load = None

@@ -77,7 +77,7 @@ def train(args) -> dict:
 
     # 模型和优化器
     model = load_model(Path(args.init), device)
-    model.gradient_checkpointing = device.type == "cuda" and not model.cfg.moe_experts
+    model.gradient_checkpointing = device.type == "cuda"
     model.checkpoint_policy = "selective"
     if model.cfg.vocab_size != train_data.vocab_size:
         raise ValueError(f"模型的词表是 {model.cfg.vocab_size}，数据是用 {train_data.vocab_size} 的词表切的")

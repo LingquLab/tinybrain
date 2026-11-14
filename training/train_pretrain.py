@@ -118,7 +118,7 @@ def train(args) -> dict:
 
     # 模型和优化器
     model, origin = build_model(args, train_data.vocab_size, device)
-    model.gradient_checkpointing = device.type == "cuda" and not model.cfg.moe_experts
+    model.gradient_checkpointing = device.type == "cuda"
     model.checkpoint_policy = "selective"
     windows = train_data.windows(args.seq_len)
     steps = total_steps(args, windows)

@@ -27,7 +27,9 @@ def main(argv=None):
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--autotune", action="store_true", help="搜索固定形状下更快的矩阵和注意力内核")
     parser.add_argument("--cuda-graph", action="store_true", help="捕获融合 Adam 和自定义 Muon 的更新图")
-    parser.add_argument("--no-checkpoint", action="store_true", help="关闭 CUDA 普通前馈模型的逐层激活重计算")
+    parser.add_argument("--no-checkpoint", action="store_true", help="关闭 CUDA 上的逐层激活重计算")
+    parser.add_argument("--muon-momentum", choices=["float32", "bfloat16"], default="float32", help="Muon 动量的精度；bfloat16 省一半显存")
+    parser.add_argument("--offload-adam", action="store_true", help="Adam 那几组的状态放到 CPU 上（要 torchao），16 GB 的卡跑 large 时用")
     parser.add_argument("--checkpoint-policy", choices=["full", "selective"], default="selective", help="selective 保存昂贵算子结果；full 整层重算，更省显存")
     parser.add_argument("--full-logits", action="store_true", help="保留完整 logits；默认分块计算相同的交叉熵以节省显存")
     parser.add_argument("--optimizer", choices=["custom", "native"], default="custom", help="矩阵用哪个 Muon：custom 是自己写的，native 是 PyTorch 自带的")
@@ -38,9 +40,10 @@ def main(argv=None):
     setup_device(device)
     cfg = preset(args.preset, args.vocab, max_seq_len=max(args.seq, 1024))
     model = LanguageModel(cfg).to(device)
-    model.gradient_checkpointing = device.type == "cuda" and not args.no_checkpoint and not cfg.moe_experts and not args.generate
+    model.gradient_checkpointing = device.type == "cuda" and not args.no_checkpoint and not args.generate
     model.checkpoint_policy = args.checkpoint_policy
-    optimizers = build_optimizers(model, args.optimizer)
+    optimizers = build_optimizers(model, args.optimizer, muon_momentum_dtype=torch.bfloat16 if args.muon_momentum == "bfloat16" else None,
+                                  offload_adam=args.offload_adam)
     step_fn = compile_model(model, device, enabled=not args.no_compile, seq_len=args.seq, autotune=args.autotune)
     if args.generate:
         return bench_generate(model, args.vocab, args.batch, args.seq, device, args.no_compile)
