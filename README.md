@@ -206,7 +206,7 @@ X \leftarrow H^{\text{res}} X + h^{\text{post}} \otimes F\!\left(\textstyle\sum_
 双随机用 Sinkhorn 迭代得到：对 $`\exp(\text{logits})`$ 交替按列、按行归一，在对数域里做 20 次：
 
 ```math
-\log M \leftarrow \log M - \operatorname{logsumexp}_{\text{行}}(\log M),\qquad \log M \leftarrow \log M - \operatorname{logsumexp}_{\text{列}}(\log M)
+\log M \leftarrow \log M - \mathrm{logsumexp}_{\text{行}}(\log M),\qquad \log M \leftarrow \log M - \mathrm{logsumexp}_{\text{列}}(\log M)
 ```
 
 这里用的是**静态**版：系数不看输入，整个模型所有子层的系数放在一起一次算完，几乎不花时间。初始化让它等价于普通残差（$`H^{\text{res}} \approx I`$，第 $`s`$ 个子层主要读第 $`s \bmod n`$ 条流）。代码：`lm/layers/hyper.py`。
@@ -234,7 +234,7 @@ g_s = \sigma\!\left(\frac{\langle \text{RMSNorm}(X_s),\ \text{RMSNorm}(K_s\,e)\r
 
 ### 流的入口和出口
 
-- **入口**：一个位置有三份来源（词向量、二元记忆、三元记忆）。每条流 $`m`$ 有一个自己的查询向量 $`q_m`$，对来源打分、加权求和：$`X_m = \sum_s \operatorname{softmax}_s\!\big(q_m^\top k_s / \sqrt{d_k}\big)\, \text{src}_s`$。不同的流可以偏好不同的来源。
+- **入口**：一个位置有三份来源（词向量、二元记忆、三元记忆）。每条流 $`m`$ 有一个自己的查询向量 $`q_m`$，对来源打分、加权求和：$`X_m = \sum_s \mathrm{softmax}_s\!\big(q_m^\top k_s / \sqrt{d_k}\big)\, \text{src}_s`$。不同的流可以偏好不同的来源。
 - **出口**：一个可学的查询向量对 4 条流打分、加权合成一份。查询从零开始，所以一开始就是 4 条流的平均。
 
 代码：`lm/layers/streams.py`。
@@ -255,11 +255,11 @@ g_s = \sigma\!\left(\frac{\langle \text{RMSNorm}(X_s),\ \text{RMSNorm}(K_s\,e)\r
 large 档换成混合专家：第 1 层仍是普通前馈；其余各层是 2 个**共享专家**（和路由专家同宽，合起来就是一个半宽的前馈层），加上从 48 个四分之一宽的路由专家里选 8 个。按宽度算，每个词用到全部专家的 20%：
 
 ```math
-s = \sqrt{\operatorname{softplus}(W_r z)},\qquad \mathcal{K} = \operatorname{top\text{-}k}(s + b),\qquad y = \text{FFN}_{\text{shared}}(x) + \sum_{e \in \mathcal{K}} \frac{s_e}{\sum_{e' \in \mathcal{K}} s_{e'}}\,\text{FFN}_e(z)
+s = \sqrt{\mathrm{softplus}(W_r z)},\qquad \mathcal{K} = \mathrm{top\text{-}k}(s + b),\qquad y = \text{FFN}_{\text{shared}}(x) + \sum_{e \in \mathcal{K}} \frac{s_e}{\sum_{e' \in \mathcal{K}} s_{e'}}\,\text{FFN}_e(z)
 ```
 
 负载均衡有两层：
-- **偏置均衡**（不参与求导）：每个专家有一个偏置 $`b_e`$，只在「挑谁」时加上。每步按实际负载调整：$`b_e \leftarrow b_e + \gamma \cdot \operatorname{sign}(1/E - \text{load}_e)`$，$`\gamma = 10^{-3}`$。活儿多的专家偏置降一点，下次就少被挑。
+- **偏置均衡**（不参与求导）：每个专家有一个偏置 $`b_e`$，只在「挑谁」时加上。每步按实际负载调整：$`b_e \leftarrow b_e + \gamma \cdot \mathrm{sign}(1/E - \text{load}_e)`$，$`\gamma = 10^{-3}`$。活儿多的专家偏置降一点，下次就少被挑。
 - **很轻的均衡损失**：$`\mathcal{L}_{\text{bal}} = E \sum_e \text{load}_e \cdot \text{share}_e`$，权重 $`10^{-4}`$。$`\text{load}_e`$ 是专家实际接了多大比例的词，$`\text{share}_e`$ 是它平均拿到多大比例的分数。
 
 可选 LatentMoE：先把输入压到更窄的宽度，路由和专家都在压缩后的空间里算，最后再升回来。代码：`lm/layers/moe.py`。
@@ -369,22 +369,22 @@ tinybrain pretrain --help     # 全部参数：模型（--dim、--n-layers……
 下一个词预测，所有位置都算交叉熵；有 MoE 时加上均衡损失：
 
 ```math
-\mathcal{L} = -\frac{1}{T}\sum_{t=1}^{T} \log p_\theta(x_{t} \mid x_{<t}) + 10^{-4}\,\mathcal{L}_{\text{bal}}
+\mathcal{L} = -\frac{1}{T}\sum_{t=1}^{T} \log p_\theta(x_{t} \mid x_{\lt t}) + 10^{-4}\,\mathcal{L}_{\text{bal}}
 ```
 
 **模型很有把握时的梯度（softmax 塌缩）。** Barron 等（Google DeepMind，[arXiv 2610.31642](https://arxiv.org/abs/2610.31642)，按 v3）指出：标准实现里正确词的梯度是 $`p_t - 1`$。设正确词领先其余所有词的间隔为
 
 ```math
-m = z_t - \operatorname{LSE}_{j \neq t}\, z_j
+m = z_t - \mathrm{LSE}_{j \neq t}\, z_j
 ```
 
 $`m`$ 超过约 16.6（FP32；BF16 约 5.5）时，$`p_t`$ 舍入成 1，正确项的梯度变成 0，其余词的梯度却还是正的，整份梯度加起来不再是 0。`lm/loss.py` 换成数学上相等、但不会舍入掉的写法：
 
 ```math
-\ell = \operatorname{softplus}(-m),\qquad \frac{\partial \ell}{\partial z_t} = -\sigma(-m)
+\ell = \mathrm{softplus}(-m),\qquad \frac{\partial \ell}{\partial z_t} = -\sigma(-m)
 ```
 
-$`m`$ 用 $`-\operatorname{LSE}_{j\neq t}(z_j - z_t)`$ 来算，其余词全是 $`-\infty`$ 时先截到 $`-10^4`$（v3 勘误里的 NaN）。CPU/MPS 的分块损失、要整张输出时的损失、强化学习里的对数概率都走这条路；CUDA 上的 Liger 融合内核还是标准写法。论文还给出：用 Adam 加权重衰减时，间隔会停在 $`\ln(1/\varepsilon)`$ 附近。我们的默认 $`\varepsilon = 10^{-10}`$ 对应约 23，已经越过 FP32 的临界值，所以验证时日志里多一列 `saturated`（第一行里间隔超过临界值的词占比，屏幕上显示为「塌缩」）。它在 CUDA 上明显不是 0 时，可以加 `--adam-eps 1e-7`（对应约 16.1）。
+$`m`$ 用 $`-\mathrm{LSE}_{j\neq t}(z_j - z_t)`$ 来算，其余词全是 $`-\infty`$ 时先截到 $`-10^4`$（v3 勘误里的 NaN）。CPU/MPS 的分块损失、要整张输出时的损失、强化学习里的对数概率都走这条路；CUDA 上的 Liger 融合内核还是标准写法。论文还给出：用 Adam 加权重衰减时，间隔会停在 $`\ln(1/\varepsilon)`$ 附近。我们的默认 $`\varepsilon = 10^{-10}`$ 对应约 23，已经越过 FP32 的临界值，所以验证时日志里多一列 `saturated`（第一行里间隔超过临界值的词占比，屏幕上显示为「塌缩」）。它在 CUDA 上明显不是 0 时，可以加 `--adam-eps 1e-7`（对应约 16.1）。
 
 ### 按轮数训
 
@@ -395,14 +395,14 @@ $`m`$ 用 $`-\operatorname{LSE}_{j\neq t}(z_j - z_t)`$ 来算，其余词全是 
 **Muon**（`training/muon.py`）管所有矩阵（注意力、前馈、专家、各种投影）。思路是：先做动量，再把更新量「正交化」——让它的奇异值都接近 1，这样每个方向走的步子一样大，不会被少数几个大方向主导：
 
 ```math
-B \leftarrow \mu B + (1-\mu) G,\qquad U = (1-\mu) G + \mu B\ \ (\text{Nesterov}),\qquad O = \operatorname{NS}_5(U)
+B \leftarrow \mu B + (1-\mu) G,\qquad U = (1-\mu) G + \mu B\ \ (\text{Nesterov}),\qquad O = \mathrm{NS}_5(U)
 ```
 
 ```math
 W \leftarrow (1 - \eta\lambda)\,W - \eta \sqrt{\max(1,\ m/n)}\; O
 ```
 
-$`\operatorname{NS}_5`$ 是 5 次 Newton–Schulz 迭代，不用做 SVD：
+$`\mathrm{NS}_5`$ 是 5 次 Newton–Schulz 迭代，不用做 SVD：
 
 ```math
 X_0 = U / \lVert U \rVert,\qquad A = X X^\top,\qquad X \leftarrow aX + (bA + cA^2)\,X,\qquad (a, b, c) = (3.4445,\ -4.7750,\ 2.0315)
@@ -497,7 +497,7 @@ tinybrain pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_mini.p
 **只在回答上算损失**：每个位置带一个遮罩 $`m_t \in \{0,1\}`$，只有助手的回答和它后面的 `<|im_end|>` 是 1：
 
 ```math
-\mathcal{L}_{\text{SFT}} = -\frac{\sum_t m_t \log p_\theta(x_t \mid x_{<t})}{\sum_t m_t}
+\mathcal{L}_{\text{SFT}} = -\frac{\sum_t m_t \log p_\theta(x_t \mid x_{\lt t})}{\sum_t m_t}
 ```
 
 对话按长度打包成等长的行（一段对话不拆到两行，行尾用填充补齐），按轮数训（`--epochs`），学习率默认是预训练的 0.1 倍。
@@ -527,17 +527,17 @@ tinybrain pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_mini.p
 **PPO** 的策略损失（每个位置 $`t`$）：
 
 ```math
-\mathcal{L}^{\text{PPO}} = -\mathbb{E}_t\Big[\min\big(\rho_t A_t,\ \operatorname{clip}(\rho_t,\,1-\epsilon,\,1+\epsilon)\,A_t\big)\Big],\qquad \rho_t = \frac{\pi_\theta(y_t \mid h_t)}{\pi_{\theta_{\text{old}}}(y_t \mid h_t)}
+\mathcal{L}^{\text{PPO}} = -\mathbb{E}_t\Big[\min\big(\rho_t A_t,\ \mathrm{clip}(\rho_t,\,1-\epsilon,\,1+\epsilon)\,A_t\big)\Big],\qquad \rho_t = \frac{\pi_\theta(y_t \mid h_t)}{\pi_{\theta_{\text{old}}}(y_t \mid h_t)}
 ```
 
 - $`\rho_t`$ 是新旧策略的概率比：同一批回答要用来更新好几次，更新后的策略和采样时的不一样了，所以要按比例修正；
-- $`\operatorname{clip}`$ 不让一次更新走太远；
+- $`\mathrm{clip}`$ 不让一次更新走太远；
 - 优势 $`A_t`$ 要一个**价值模型**（critic）来估，和策略一样大，训练和显存都翻倍。
 
 **GRPO**（DeepSeekMath）去掉了价值模型：每道题采一组 $`G`$ 个回答，用**组内比较**当优势：
 
 ```math
-A_i = \frac{r_i - \operatorname{mean}(r_1, \dots, r_G)}{\operatorname{std}(r_1, \dots, r_G)}
+A_i = \frac{r_i - \mathrm{mean}(r_1, \dots, r_G)}{\mathrm{std}(r_1, \dots, r_G)}
 ```
 
 并且每个回答的损失按它的长度 $`|y_i|`$ 平均。
