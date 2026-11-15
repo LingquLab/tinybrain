@@ -1,4 +1,4 @@
-# tinybrain
+<h1 align="center"><img src="docs/images/tinybrain.svg" alt="tinybrain" width="100%"></h1>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2140d6)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-2140d6)](pyproject.toml)

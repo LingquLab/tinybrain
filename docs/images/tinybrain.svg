@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="tinybrain">
+  <title>tinybrain</title>
+  <rect width="1280" height="640" fill="#2140d6"/>
+  <g transform="translate(92,122) scale(0.92)">
+    <path d="M238.71,0 L209.91,180 H40 A40,40 0 0 1 0,140 A140,140 0 0 1 140,0 Z" fill="#ffd21f"/>
+    <path d="M252.89,0 H260 A140,140 0 0 1 400,140 V180 H224.09 Z" fill="#e9482b"/>
+    <rect x="64" y="194" width="226" height="100" rx="50" fill="#ffffff"/>
+    <path d="M304,194 H400 A92,92 0 0 1 308,286 H304 Z" fill="#000000"/>
+    <path d="M304,300 H384 A40,40 0 0 1 304,300 Z" fill="#ffd21f"/>
+    <path d="M285.50,308.00 L285.50,354.00 A20.50,20.50 0 0 0 306.00,374.50 L2306.00,374.50" stroke="#ffd21f" stroke-width="9.5" fill="none"/>
+    <path d="M276.50,308.00 L276.50,354.00 A29.50,29.50 0 0 0 306.00,383.50 L2306.00,383.50" stroke="#ffffff" stroke-width="9.5" fill="none"/>
+    <path d="M267.50,308.00 L267.50,354.00 A38.50,38.50 0 0 0 306.00,392.50 L2306.00,392.50" stroke="#e9482b" stroke-width="9.5" fill="none"/>
+    <path d="M258.50,308.00 L258.50,354.00 A47.50,47.50 0 0 0 306.00,401.50 L2306.00,401.50" stroke="#000000" stroke-width="9.5" fill="none"/>
+  </g>
+  <g transform="translate(540,384) scale(0.6093)" stroke="#ffd21f" stroke-width="34" fill="none">
+    <path d="M0,-168.6 V-62.0 A45.0,45.0 0 0 0 45.0,-17.0 H67.5" transform="translate(50.8,0)"/>
+    <path d="M-33.8,-107.0 H54.0" transform="translate(50.8,0)"/>
+    <path d="M0,-124 V0" transform="translate(169.8,0)"/>
+    <rect x="152.8" y="-173.3" width="34" height="34" fill="#e9482b" stroke="none"/>
+    <path d="M0,-124 V0" transform="translate(225.8,0)"/>
+    <path d="M0,-62.0 A45.0,45.0 0 0 1 90.0,-62.0 V0" transform="translate(225.8,0)"/>
+    <path d="M0,-124 V-62.0 A45.0,45.0 0 0 0 90.0,-62.0" transform="translate(371.9,0)"/>
+    <path d="M90.0,-124 V11.9 A45.0,45.0 0 0 1 45.0,56.9 H11.2" transform="translate(371.9,0)"/>
+    <path d="M0,-183.5 V0" transform="translate(517.9,0)"/>
+    <path d="M0,-62.0 A45.0,45.0 0 1 1 90.0,-62.0 A45.0,45.0 0 1 1 0,-62.0" transform="translate(517.9,0)"/>
+    <path d="M0,-124 V0" transform="translate(663.9,0)"/>
+    <path d="M0,-62.0 A45.0,45.0 0 0 1 45.0,-107.0 H67.5" transform="translate(663.9,0)"/>
+    <path d="M0,-62.0 A45.0,45.0 0 1 1 90.0,-62.0 A45.0,45.0 0 1 1 0,-62.0" transform="translate(774.1,0)"/>
+    <path d="M90.0,-124 V0" transform="translate(774.1,0)"/>
+    <path d="M0,-124 V0" transform="translate(920.1,0)"/>
+    <rect x="903.1" y="-173.3" width="34" height="34" fill="#e9482b" stroke="none"/>
+    <path d="M0,-124 V0" transform="translate(976.1,0)"/>
+    <path d="M0,-62.0 A45.0,45.0 0 0 1 90.0,-62.0 V0" transform="translate(976.1,0)"/>
+  </g>
+</svg>

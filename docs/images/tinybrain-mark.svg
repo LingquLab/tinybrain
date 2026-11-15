@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="tinybrain">
+  <title>tinybrain</title>
+  <rect width="512" height="512" fill="#2140d6"/>
+  <g transform="translate(56,66) scale(1.0)">
+    <path d="M238.71,0 L209.91,180 H40 A40,40 0 0 1 0,140 A140,140 0 0 1 140,0 Z" fill="#ffd21f"/>
+    <path d="M252.89,0 H260 A140,140 0 0 1 400,140 V180 H224.09 Z" fill="#e9482b"/>
+    <rect x="64" y="194" width="226" height="100" rx="50" fill="#ffffff"/>
+    <path d="M304,194 H400 A92,92 0 0 1 308,286 H304 Z" fill="#000000"/>
+    <path d="M304,300 H384 A40,40 0 0 1 304,300 Z" fill="#ffd21f"/>
+    <path d="M285.50,308.00 L285.50,380.00" stroke="#ffd21f" stroke-width="9.5" fill="none"/>
+    <path d="M276.50,308.00 L276.50,380.00" stroke="#ffffff" stroke-width="9.5" fill="none"/>
+    <path d="M267.50,308.00 L267.50,380.00" stroke="#e9482b" stroke-width="9.5" fill="none"/>
+    <path d="M258.50,308.00 L258.50,380.00" stroke="#000000" stroke-width="9.5" fill="none"/>
+  </g>
+</svg>
