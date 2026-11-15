@@ -4,6 +4,8 @@
 
 60B token 开源中文数据 · 自己训的分词器 · 预训练到强化学习的全流程 · 专门为古文和诗词练过
 
+[English](README.en.md) · [视频介绍（B 站）](https://www.bilibili.com/video/BV1kqsj6EEtT/) · [数据集（ModelScope）](https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset)
+
 tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https://github.com/jingyaogong/minimind)、[nanochat](https://github.com/karpathy/nanochat) 一样，所有代码都是自己写的、能一行行读懂；不一样的是：
 
 - **数据也从零做**：从 26 个公开来源下载、清洗、跨来源去重、按配比和质量分成四档（1B / 5B / 20B / 60B token），这套数据叫 **tinybrain dataset**，做数据的每一步代码都在 `dataset/` 里。
