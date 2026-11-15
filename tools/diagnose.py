@@ -18,11 +18,14 @@
   5. 用上下文    损失按片段里的位置分段。前面的词越多损失应该越低；一路持平说明注意力没起作用，模型只靠最近两三个词。
                  同时比较「模型放在前 50 名以外的概率」和「真实答案落在前 50 名以外的比例」，看概率有没有撒到不相干的词上。
   6. 结束符      真正的文档结尾处，模型给结束符的概率，对比别处。
+  8. 尾部分语言  在纯中文的上文里，模型给拉丁字母片段、假名这些词多少概率，对比它们实际出现的比例。总量对得上（第 5 项）
+                 不代表成分对：模型可能知道「这里有一成机会出一个生僻词」，却不知道该是哪一类。差得多时，不截断的采样会抽出外文片段。
   7. 采样        同一个开头（前面放文档结束符，和 tinybrain generate 一样），贪心、默认采样、温度 1 各续写一次，报告 4 词片段的重复比例。
 """
 import argparse
 import copy
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +48,31 @@ def repeat_share(ids: list[int], n: int = 4) -> float:
     """n 个词的片段里，有多大比例是前面出现过的。真实文字一般在 0.05 以下，打转的文字接近 1。"""
     grams = [tuple(ids[i:i + n]) for i in range(len(ids) - n + 1)]
     return 1 - len(set(grams)) / max(1, len(grams))
+
+
+KINDS = ("汉字", "拉丁字母", "假名、韩文、西里尔字母", "数字、标点等")
+DEEP = 1e-4  # 概率低于它的词算「深尾」：温度 1.0 不截断时，怪词主要从这里抽出来
+
+
+def token_kinds(tok: Tokenizer) -> torch.Tensor:
+    """词表里每个词属于哪一类文字（KINDS 的下标）。"""
+    def kind(piece: str) -> int:
+        if re.search(r"[\u4e00-\u9fff]", piece):
+            return 0
+        if re.search(r"[\u3040-\u30ff\uac00-\ud7af\u0400-\u04ff]", piece):
+            return 2
+        return 1 if re.search(r"[A-Za-z]", piece) else 3
+    return torch.tensor([kind(tok.sp.id_to_piece(i)) for i in range(tok.vocab_size)])
+
+
+def chinese_context(kinds_of_input: torch.Tensor, span: int = 16) -> torch.Tensor:
+    """哪些位置的前 span 个词（含自己）全是汉字或标点、且至少一半是汉字。形状同输入（一维）。"""
+    out = torch.zeros_like(kinds_of_input, dtype=torch.bool)
+    if kinds_of_input.numel() >= span:
+        allowed = ((kinds_of_input == 0) | (kinds_of_input == 3)).float().unfold(0, span, 1).mean(-1) == 1
+        mostly = (kinds_of_input == 0).float().unfold(0, span, 1).mean(-1) >= 0.5
+        out[span - 1:] = allowed & mostly
+    return out
 
 
 def shards_of(data) -> list:
@@ -248,6 +276,9 @@ def diagnose(args) -> dict:
     # 5. 用上下文 + 6. 结束符
     token_loss, eos_at_end, eos_elsewhere, eos_rank = [], [], [], []
     tail_mass, tail_hits = 0.0, 0
+    kinds = token_kinds(tok)
+    zeros = lambda: torch.zeros(len(KINDS), dtype=torch.float64)  # noqa: E731
+    kind_mass, kind_hits, deep_mass, deep_hits, chinese_n = zeros(), zeros(), zeros(), zeros(), 0
     for r in range(rows.size(0)):
         logits = base if r == 0 else full_forward(model, rows[r:r + 1, :-1], half=True)
         target = rows[r:r + 1, 1:].cpu()
@@ -257,6 +288,16 @@ def diagnose(args) -> dict:
         top = probs.topk(50, dim=-1)
         tail_mass += float((1 - top.values.sum(-1)).sum())
         tail_hits += int((~(top.indices == target[0][:, None]).any(-1)).sum())
+        pure = chinese_context(kinds[rows[r, :-1].cpu()])
+        pp, tt = probs[pure], target[0][pure]
+        deep = pp * (pp < DEEP)
+        true_is_deep = pp.gather(1, tt[:, None])[:, 0] < DEEP
+        for k in range(len(KINDS)):
+            kind_mass[k] += float(pp[:, kinds == k].sum())
+            deep_mass[k] += float(deep[:, kinds == k].sum())
+        kind_hits += torch.bincount(kinds[tt], minlength=len(KINDS))
+        deep_hits += torch.bincount(kinds[tt[true_is_deep]], minlength=len(KINDS))
+        chinese_n += int(pure.sum())
         is_end = target[0] == eos
         eos_at_end += p_eos[is_end].tolist()
         eos_elsewhere += p_eos[~is_end].tolist()
@@ -286,6 +327,26 @@ def diagnose(args) -> dict:
     report["eos"] = dict(at_end=float(np.mean(eos_at_end)), elsewhere=float(np.mean(eos_elsewhere)))
 
     # 7. 采样
+    print(f"\n[8] 尾部分不分语言（{chinese_n} 个纯中文上文的位置：前 16 个词全是汉字或标点）")
+    if chinese_n:
+        print("  下一个词的类别        真实占比   模型给的概率   倍数")
+        for k, name in enumerate(KINDS):
+            ratio = f"{kind_mass[k] / kind_hits[k]:8.2f}" if kind_hits[k] >= 20 else "  （太少）"
+            print(f"  {name:<12} {kind_hits[k] / chinese_n:9.3%} {kind_mass[k] / chinese_n:11.3%} {ratio}")
+        foreign_model = float(kind_mass[1] + kind_mass[2]) / chinese_n
+        foreign_real = float(kind_hits[1] + kind_hits[2]) / chinese_n
+        deep_model, deep_real = float(deep_mass.sum()), max(float(deep_hits.sum()), 1.0)
+        print(f"  深尾（概率低于 {DEEP:g} 的词）：模型放了 {deep_model / chinese_n:.2%}，真实答案落在这里 {float(deep_hits.sum()) / chinese_n:.2%}；"
+              f"其中不是中文的：模型 {float(deep_mass[1] + deep_mass[2]) / max(deep_model, 1e-12):.1%}，真实 {float(deep_hits[1] + deep_hits[2]) / deep_real:.1%}")
+        report["script"] = dict(foreign_model=foreign_model, foreign_real=foreign_real, positions=chinese_n,
+                                deep_foreign_model=float(deep_mass[1] + deep_mass[2]) / max(deep_model, 1e-12),
+                                deep_foreign_real=float(deep_hits[1] + deep_hits[2]) / deep_real)
+        deep_foreign = report["script"]["deep_foreign_model"]
+        if deep_foreign > 3 * report["script"]["deep_foreign_real"] + 0.05:
+            problems.append(f"纯中文的上文里，模型深尾的概率有 {deep_foreign:.0%} 放在非中文的词上，真实答案落在深尾时只有 "
+                            f"{report['script']['deep_foreign_real']:.0%} 不是中文：尾部的总量对，成分不对。"
+                            "不截断的采样会抽出外文片段；用 top_p 或 top_k 截掉尾部可以避开")
+
     print(f"\n[7] 采样（每个开头续写 {args.max_new} 个词；后面的数是 4 词重复比例）")
     settings = [("贪心", dict(temperature=0.0)), ("温度0.8 前50", dict(temperature=0.8, top_k=50)), ("温度1.0", dict(temperature=1.0))]
     report["samples"] = {}
@@ -303,8 +364,8 @@ def diagnose(args) -> dict:
         for p in problems:
             print("  ✗ " + p)
     else:
-        print("  ✓ 各条计算路径一致、没有偷看、上下文有用：生成和训练算的是同一个函数。")
-        print("    这时文字打转只和模型学到什么程度有关：看 [1] 的损失和 [7] 里温度 1.0 那一行。贪心和低温度在损失 3.5 以上时本来就会打转。")
+        print("  ✓ 各条计算路径一致、没有偷看、上下文有用、尾部成分正常：生成和训练算的是同一个函数。")
+        print("    这只说明代码没有算错，不说明续写质量够好：贪心打转、接词不合事实要另外看 [7] 的文字。")
     report["problems"] = problems
     return report
 
