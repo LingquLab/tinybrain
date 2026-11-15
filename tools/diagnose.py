@@ -16,6 +16,7 @@
                  输入的均方小到和 0.0078 可比时，半精度训练、单精度评测会得到不同的结果。
   4. 因果性      改掉后半段的词，前半段的输出不能变。变了就是训练时偷看了后面的词：损失很低，生成一塌糊涂。
   5. 用上下文    损失按片段里的位置分段。前面的词越多损失应该越低；一路持平说明注意力没起作用，模型只靠最近两三个词。
+                 同时比较「模型放在前 50 名以外的概率」和「真实答案落在前 50 名以外的比例」，看概率有没有撒到不相干的词上。
   6. 结束符      真正的文档结尾处，模型给结束符的概率，对比别处。
   7. 采样        同一个开头（前面放文档结束符，和 tinybrain generate 一样），贪心、默认采样、温度 1 各续写一次，报告 4 词片段的重复比例。
 """
@@ -246,11 +247,16 @@ def diagnose(args) -> dict:
 
     # 5. 用上下文 + 6. 结束符
     token_loss, eos_at_end, eos_elsewhere, eos_rank = [], [], [], []
+    tail_mass, tail_hits = 0.0, 0
     for r in range(rows.size(0)):
         logits = base if r == 0 else full_forward(model, rows[r:r + 1, :-1], half=True)
         target = rows[r:r + 1, 1:].cpu()
         token_loss.append(-token_log_probs(logits, target)[0])
-        p_eos = torch.softmax(logits[0], dim=-1)[:, eos]
+        probs = torch.softmax(logits[0], dim=-1)
+        p_eos = probs[:, eos]
+        top = probs.topk(50, dim=-1)
+        tail_mass += float((1 - top.values.sum(-1)).sum())
+        tail_hits += int((~(top.indices == target[0][:, None]).any(-1)).sum())
         is_end = target[0] == eos
         eos_at_end += p_eos[is_end].tolist()
         eos_elsewhere += p_eos[~is_end].tolist()
@@ -265,6 +271,13 @@ def diagnose(args) -> dict:
         near, far = float(token_loss[:, 4:32].mean()), float(token_loss[:, 128:].mean())
         if far > near - 0.1:
             problems.append(f"前面的词再多，损失也不降（第 4–32 个词 {near:.2f}，第 128 个词以后 {far:.2f}）：模型没在用远处的上下文")
+
+    tail_model, tail_real = tail_mass / token_loss.numel(), tail_hits / token_loss.numel()
+    print(f"  前 50 名以外：真实的下一个词落在这里的占 {tail_real:.1%}，模型放在这里的概率是 {tail_model:.1%}。"
+          "两个数接近，说明模型没有把概率乱撒；这一块就是温度 1.0 不截断时怪词的来源，也是只取前 50 时被丢掉的部分")
+    report["tail"] = dict(model=tail_model, real=tail_real)
+    if tail_model > 1.5 * tail_real + 0.02:
+        problems.append(f"模型放在前 50 名以外的概率（{tail_model:.1%}）比真实答案落在那里的比例（{tail_real:.1%}）高得多：概率撒到了不相干的词上")
 
     print(f"\n[6] 结束符（{len(eos_at_end)} 个真正的文档结尾）")
     print(f"  结尾处给结束符的概率：中位 {np.median(eos_at_end):.3%}，平均 {np.mean(eos_at_end):.3%}；别处平均 {np.mean(eos_elsewhere):.4%}"
