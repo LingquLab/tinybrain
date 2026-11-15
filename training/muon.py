@@ -2,7 +2,8 @@
 
 每一步先做动量，再把更新量「正交化」——用几次 Newton-Schulz 迭代把它的奇异值都推到 1 附近，
 这样每个方向走的步子一样大，不会被少数几个大的方向主导。只适用于二维以上的参数。
-形状相同的参数叠在一起一次算完（GPU 上比一个个算快得多）。
+形状相同的参数叠在一起一次算完（GPU 上比一个个算快得多）；动量按参数各存一份，
+所以一步怎么走和「这一步还有哪些参数一起走」无关——多卡训练时每张卡只更新自己管的那几个矩阵（training/distributed.py）。
 """
 import torch
 
@@ -30,6 +31,12 @@ class Muon(torch.optim.Optimizer):
             if any(p.ndim < 2 for p in group["params"]):
                 raise ValueError("Muon 只能用于二维以上的参数")
 
+    def _momentum(self, p: torch.Tensor) -> torch.Tensor:
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(p.grad, dtype=self.momentum_dtype or p.grad.dtype)
+        return state["momentum_buffer"]
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -42,13 +49,10 @@ class Muon(torch.optim.Optimizer):
                 if p.grad is not None:
                     buckets.setdefault(p.shape, []).append(p)
             for shape, params in buckets.items():
+                bufs = [self._momentum(p) for p in params]
+                torch._foreach_lerp_(bufs, [p.grad.to(bufs[0].dtype) for p in params], 1 - group["momentum"])
                 grads = torch.stack([p.grad for p in params])
-                key = (shape, len(params))
-                buf = self.state[params[0]].get(key)
-                if buf is None:
-                    buf = self.state[params[0]][key] = torch.zeros_like(grads, dtype=self.momentum_dtype or grads.dtype)
-                buf.lerp_(grads.to(buf.dtype), 1 - group["momentum"])
-                momentum = buf.to(grads.dtype)
+                momentum = torch.stack(bufs).to(grads.dtype)
                 update = grads.lerp(momentum, group["momentum"]) if group["nesterov"] else momentum
                 half = update.is_cuda  # CUDA 上用半精度算正交化：快，而且只要方向大致对就行
                 update = orthogonalize(update.bfloat16() if half else update, group["ns_steps"]).to(grads.dtype)
@@ -62,3 +66,26 @@ class Muon(torch.optim.Optimizer):
                     else:
                         p.add_(u, alpha=-lr * scale)
         return loss
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """也读以前的存档：那时同形状的矩阵共用一份叠起来的动量，存在这组第一个矩阵名下，键是（形状，个数），这里拆回每个参数一份。
+        PyTorch 加载时会把状态转成参数的精度，动量要是本来存成 bfloat16，再转回去。"""
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            same_shape = {}
+            for p in group["params"]:
+                same_shape.setdefault(tuple(p.shape), []).append(p)
+            for p in group["params"]:
+                state = self.state.get(p, {})
+                for key in [k for k in state if isinstance(k, tuple)]:
+                    shape, n = key
+                    stacked = state.pop(key)
+                    peers = same_shape[tuple(shape)]
+                    block = peers[peers.index(p):peers.index(p) + n]  # 当时一起走的那几个（都有梯度时就是这组里同形状的全部）
+                    if len(block) == n:
+                        for q, buf in zip(block, stacked.unbind(0)):
+                            self.state[q]["momentum_buffer"] = buf.clone()
+            if self.momentum_dtype is not None:
+                for p in group["params"]:
+                    if "momentum_buffer" in self.state.get(p, {}):
+                        self.state[p]["momentum_buffer"] = self.state[p]["momentum_buffer"].to(self.momentum_dtype)

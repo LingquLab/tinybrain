@@ -594,6 +594,19 @@ tinybrain pretrain --data data/tokens/base --out out/medium/pretrain --preset me
 tinybrain bench medium --batch 4 --grad-accum 4 --seq 2048 --autotune --attention-backend cudnn --gpu-memory-fraction 0.85
 ```
 
+**多卡（ZeRO-1）**：预训练用 torchrun 启动就是多卡，每张卡一个进程（NCCL），代码在 `training/distributed.py`。`--batch-size` 是每张卡的批大小，每步一共「批大小 × 累积 × 卡数」个片段。
+
+```bash
+torchrun --standalone --nproc-per-node 8 -m training.train_pretrain --preset medium --data data/tokens/base --batch-size 2 --grad-accum 1 \
+    --seq-len 2048 --epochs 1 --eval-batch-size 16 --eval-micro-batch-size 4
+```
+
+- 每个参数归一张卡管（按大小贪心地分）：梯度只汇总到管它的卡上，这张卡用 Muon 或 Adam 更新它，再把新参数广播给其他卡。优化器状态（Adam 的两个矩、Muon 的动量）每张卡只存自己那份，约为单卡的 1/卡数；通信量和普通的数据并行一样。
+- 第几步、第几个微批、第几张卡取哪些片段只由种子和序号决定，合起来正好是单卡同一步取的那些。所以每步的片段数一样时，多卡和单卡训出来的是同一个模型（有测试对照，只差浮点加法的顺序），存档也能在单卡和多卡之间互相 `--resume`。比如 5070 Ti 上用 `--batch-size 4 --grad-accum 4` 训到一半的 medium，换到 8 张卡上用 `--batch-size 2 --grad-accum 1` 接着训。每步的片段数和存档不一样时，`--resume` 会拒绝。
+- 第一次给 parquet 时只有 0 号卡切词，其他卡等它切完。只有 0 号卡打印、写日志和存档；验证的几批分给各卡算。
+- MoE 的路由偏置按各卡负载的平均来调。多卡时不能用 `--cuda-graph`、`--offload-adam`。
+- 现在只有预训练（含退火）支持多卡，SFT、蒸馏、RL 还是单卡。
+
 Windows 默认编码为 GBK 时，先设 `$env:PYTHONUTF8 = 1`（PowerShell）再运行 `tinybrain …`，或者用 `python -X utf8 -m tools.bench small --batch 8 --seq 4096`。如果 Triton 默认缓存目录报路径错误，可在 PowerShell 中先设置 `$env:TRITON_CACHE_DIR = "$PWD\.cache\triton"` 和 `$env:TORCHINDUCTOR_CACHE_DIR = "$PWD\.cache\inductor"`。
 
 训练中也可以接入 TensorBoard：安装 `pip install -e ".[monitor]"`，运行 `tinybrain tensorboard --run out/small/pretrain`，再运行 `python -m tensorboard.main --logdir out/small/pretrain/tensorboard --host 127.0.0.1 --port 6006`，打开 `http://127.0.0.1:6006`。同步工具会补录已有 JSONL 指标并持续追加训练/验证损失、各参数组学习率、吞吐和进度；不需要重启训练。历史数据的横轴使用训练步数。

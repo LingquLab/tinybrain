@@ -283,14 +283,17 @@ def find_stage(run, stages: tuple) -> Path:
 def save_checkpoint(path: Path, model: LanguageModel, optimizers: list, step: int, **extra) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    state = dict(model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers], step=step, model_config=model.cfg.to_json(), **extra)
+    # optimizers 里可以是优化器，也可以是已经取好的状态（多卡时由 Zero.gather_optimizer_states 合成的）
+    states = [opt if isinstance(opt, dict) else opt.state_dict() for opt in optimizers]
+    state = dict(model=model.state_dict(), optimizers=states, step=step, model_config=model.cfg.to_json(), **extra)
     tmp = path.with_suffix(".tmp")
     torch.save(state, tmp)
     os.replace(tmp, path)
 
 
-def load_checkpoint(path: Path, device: torch.device) -> dict:
-    return torch.load(path, map_location=device, weights_only=False)
+def load_checkpoint(path: Path, device: torch.device, mmap: bool = False) -> dict:
+    """mmap=True：张量按需从文件里读，不一次全读进内存（多卡时每个进程都要读同一个存档）。"""
+    return torch.load(path, map_location=device, weights_only=False, mmap=mmap)
 
 
 def load_model(path: Path, device: torch.device) -> LanguageModel:
@@ -301,12 +304,25 @@ def load_model(path: Path, device: torch.device) -> LanguageModel:
     return model
 
 
-def resume(path: Path, model: LanguageModel, optimizers: list, device: torch.device) -> int:
-    """从 path 的存档接着训：恢复模型和优化器，返回已经走完的步数；没有存档返回 0。"""
+def rows_per_step_of(config: dict) -> int | None:
+    """存档里记的训练设置每步用多少个片段：批大小 × 累积 × 卡数（以前的存档没记卡数，就是单卡）。"""
+    if not config.get("batch_size"):
+        return None
+    return config["batch_size"] * (config.get("grad_accum") or 1) * (config.get("world_size") or 1)
+
+
+def resume(path: Path, model: LanguageModel, optimizers: list, device: torch.device, rows_per_step: int | None = None, shard=None) -> int:
+    """从 path 的存档接着训：恢复模型和优化器，返回已经走完的步数；没有存档返回 0。
+    rows_per_step：这次每步多少个片段。和存档时不一样就拒绝：每步取哪些片段由步数决定，每步的片段数变了，数据就接不上了。
+    shard：多卡时只留这张卡管的那部分优化器状态（Zero.shard）。参数和状态先读到内存，加载时再各自搬到参数所在的设备上。"""
     if not Path(path).exists():
         return 0
-    state = load_checkpoint(path, device)
+    state = load_checkpoint(path, torch.device("cpu"), mmap=True)
+    saved = rows_per_step_of(state.get("train_config") or {})
+    if rows_per_step is not None and saved is not None and saved != rows_per_step:
+        raise ValueError(f"存档每步 {saved} 个片段，这次每步 {rows_per_step} 个（批大小 × 累积 × 卡数）。"
+                         f"每步取哪些片段由步数决定，要接着训，这个乘积要和存档一样，比如 8 张卡就用 --batch-size {max(1, saved // 8)} --grad-accum 1")
     model.load_state_dict(state["model"])
     for opt, opt_state in zip(optimizers, state["optimizers"]):
-        opt.load_state_dict(opt_state)
+        opt.load_state_dict(shard(opt, opt_state) if shard else opt_state)
     return state["step"]
