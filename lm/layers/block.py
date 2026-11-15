@@ -5,7 +5,7 @@ from ..config import ModelConfig
 from .attention import Attention, LayerCache
 from .engram import EngramGate
 from .feedforward import FeedForward
-from .hyper import read_streams, write_streams
+from .hyper import read_normalized_streams, write_streams
 from .moe import MoE
 from .norm import RMSNorm
 
@@ -31,7 +31,7 @@ class Block(nn.Module):
         a, f = (0, 1) if pre.size(0) == 2 else (2 * self.index, 2 * self.index + 1)
         if self.engram is not None:
             x = self.engram(x, memory)
-        x = write_streams(x, self.attn(self.attn_norm(read_streams(x, pre[a])), cos, sin, cache), res[a], post[a])
-        out = self.ffn(self.ffn_norm(read_streams(x, pre[f])))
+        x = write_streams(x, self.attn(read_normalized_streams(x, pre[a], self.attn_norm), cos, sin, cache), res[a], post[a])
+        out = self.ffn(read_normalized_streams(x, pre[f], self.ffn_norm))
         out, balance_loss = out if isinstance(out, tuple) else (out, x.new_zeros(()))
         return write_streams(x, out, res[f], post[f]), balance_loss

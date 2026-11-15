@@ -14,6 +14,7 @@ dependencies = ["torch>=2.5"]
 data = ["numpy", "pyarrow", "OpenCC", "zstandard"]
 fast = ["gigatoken"]  # 切词快一个数量级（tools.prepare 自动使用）；Windows 上建议在 WSL 里装
 cuda = ["liger-kernel>=0.8.5,<0.9"]
+cudnn = ["torch>=2.13", "liger-kernel>=0.8.5,<0.9", "nvidia-cudnn-frontend>=1.32.3,<1.33"]
 monitor = ["tensorboard>=2.18"]
 
 [project.scripts]

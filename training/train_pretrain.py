@@ -45,6 +45,8 @@ COOLDOWN_INHERIT = ("data", "seq_len", "batch_size", "grad_accum", "seed")
 # 优化器的设置一律取自存档：加载优化器状态时学习率本来就会被存档里的值盖掉
 COOLDOWN_OPTIMIZER = ("optimizer", "lr_mult", "matrix_lr", "embed_lr", "head_lr", "engram_lr", "scalar_lr", "weight_decay", "adam_eps", "clip_grad",
                       "muon_momentum", "offload_adam")
+# 验证批大小不写（0）就取自存档：抽到的验证片段由它决定，和主线一样，退火分支的验证损失才能和主线直接比
+COOLDOWN_VALIDATION = ("eval_batch_size", "eval_micro_batch_size")
 
 
 def parse_overrides(pairs: list[str]) -> dict:
@@ -87,6 +89,9 @@ def setup_cooldown(args) -> tuple[dict, int, float]:
     for key in COOLDOWN_OPTIMIZER:
         if hasattr(parent, key):
             setattr(args, key, getattr(parent, key))
+    for key in COOLDOWN_VALIDATION:
+        if not getattr(args, key):
+            setattr(args, key, getattr(parent, key, 0) or 0)
     start = state["step"]
     if "next_lr_scale" in state:
         high = state["next_lr_scale"]
@@ -128,16 +133,21 @@ def evaluate(model, data, args, device: torch.device) -> tuple[float, float]:
     第二个返回值是第一行里 softmax 塌缩的词占比（见 trainer_utils.saturated_share）。"""
     was_training = model.training
     model.eval()
-    total = 0.0
+    total, rows_seen = 0.0, 0
+    batch_size = getattr(args, "eval_batch_size", 0) or args.batch_size
+    micro_batch_size = getattr(args, "eval_micro_batch_size", 0) or args.batch_size
     for i in range(args.eval_batches):
-        x, y = data.batch(args.batch_size, args.seq_len, seed=1_000_003 * (i + 1), device=device)
-        with autocast(device):
-            out = model(x, y, return_logits=False)
-        total += (out.loss - out.balance_loss).item()
+        x, y = data.batch(batch_size, args.seq_len, seed=1_000_003 * (i + 1), device=device)
+        for start in range(0, batch_size, micro_batch_size):  # 抽到的片段只由 batch_size 定，微批只决定一次前向几条
+            rows = min(micro_batch_size, batch_size - start)
+            with autocast(device):
+                out = model(x[start:start + rows], y[start:start + rows], return_logits=False)
+            total += (out.loss - out.balance_loss).item() * rows
+            rows_seen += rows
         if i == 0:
-            saturated = saturated_share(model, x, y, device)
+            saturated = saturated_share(model, x, y, device)  # 只看第一行
     model.train(was_training)
-    return total / args.eval_batches, saturated
+    return total / rows_seen, saturated
 
 
 def total_steps(args, windows: int) -> int:
@@ -166,6 +176,10 @@ def train(args) -> dict:
     parent, branch_start, branch_high = setup_cooldown(args) if args.cooldown_from else (None, 0, 1.0)
     args.data = tokens_for(args.data)
     setup_device(device)
+    if args.gpu_memory_fraction:
+        if device.type != "cuda" or not 0 < args.gpu_memory_fraction <= 1:
+            raise ValueError("--gpu-memory-fraction 要求 CUDA，且必须在 0 与 1 之间")
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, device.index)
     torch.manual_seed(args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -178,7 +192,7 @@ def train(args) -> dict:
     # 模型和优化器
     model, origin = build_model(args, train_data.vocab_size, device, parent)
     model.gradient_checkpointing = device.type == "cuda"
-    model.checkpoint_policy = "selective"
+    model.checkpoint_policy = args.checkpoint_policy
     windows = train_data.windows(args.seq_len)
     rows_per_step = args.batch_size * args.grad_accum
     optimizers = optimizers_from_args(model, args)
@@ -192,9 +206,14 @@ def train(args) -> dict:
         steps = total_steps(args, windows)
         schedule = schedule_of(args, steps)
     start_step = (resume(out / "ckpt.pt", model, optimizers, device) if args.resume else 0) or branch_start
-    (out / "config.json").write_text(json.dumps({"train": vars(args), "steps": steps, "model": json.loads(model.cfg.to_json()), "data": train_data.meta},
+    validation = dict(batch_size=args.eval_batch_size or args.batch_size,
+                      micro_batch_size=args.eval_micro_batch_size or args.batch_size,
+                      seq_len=args.seq_len, batches=args.eval_batches, seed_multiplier=1_000_003)
+    (out / "config.json").write_text(json.dumps({"train": vars(args), "steps": steps, "model": json.loads(model.cfg.to_json()), "data": train_data.meta,
+                                                "validation": validation},
                                                 ensure_ascii=False, indent=1), encoding="utf-8")
-    forward = compile_model(model, device, enabled=not args.no_compile, seq_len=args.seq_len, autotune=args.autotune)
+    forward = compile_model(model, device, enabled=not args.no_compile, seq_len=args.seq_len, autotune=args.autotune,
+                            attention_backend=args.attention_backend)
     graph_step = None
     if args.cuda_graph:
         if device.type != "cuda" or model.cfg.moe_experts:
@@ -218,13 +237,14 @@ def train(args) -> dict:
         for step in range(start_step, steps):
             scale = schedule(step)
             set_lr_scale(optimizers, scale * args.lr_mult)
-            loss_value = 0.0
+            loss_total = None
             for micro in range(args.grad_accum):  # 攒几个批次的梯度再更新一次
                 x, y = train_data.ordered_batch(args.batch_size, args.seq_len, index=step * args.grad_accum + micro, seed=args.seed, device=device)
                 with autocast(device):
                     loss = forward(x, y, return_logits=False).loss / args.grad_accum
                 loss.backward()
-                loss_value += loss.item()
+                loss_total = loss.detach() if loss_total is None else loss_total + loss.detach()
+            loss_value = loss_total.item()  # 每个完整更新只读回一次，避免逐微批同步。
             if not math.isfinite(loss_value):
                 raise RuntimeError(f"第 {step} 步的损失变成了 {loss_value}，训练停下。上一个存档在 {out / 'ckpt.pt'}")
             grad_norm = clip_gradients(model.parameters(), args.clip_grad)
@@ -305,6 +325,8 @@ def parse_args(argv=None):
     g.add_argument("--log-every", type=int, default=50)
     g.add_argument("--eval-every", type=int, default=200, help="每隔多少步在验证集上量一次；没有验证集就不量")
     g.add_argument("--eval-batches", type=int, default=20)
+    g.add_argument("--eval-batch-size", type=int, default=0, help="验证抽样批大小；0 跟随训练。固定它可跨不同训练微批比较损失")
+    g.add_argument("--eval-micro-batch-size", type=int, default=0, help="验证每次前向处理几条；0 跟随训练，不改变抽到的验证片段")
     g.add_argument("--save-every", type=int, default=500)
     g.add_argument("--resume", action="store_true", help="从输出目录里的存档接着跑")
 
@@ -312,8 +334,13 @@ def parse_args(argv=None):
     g.add_argument("--device", default="auto", help="auto、cuda、mps 或 cpu")
     g.add_argument("--no-compile", action="store_true", help="CUDA 上也不用 torch.compile")
     g.add_argument("--cuda-graph", action="store_true", help="捕获融合 Adam 和 Muon 更新图；只支持 CUDA 普通前馈模型、自定义 Muon")
+    g.add_argument("--checkpoint-policy", choices=["selective", "full"], default="selective", help="选择性重算或整层重算")
+    g.add_argument("--gpu-memory-fraction", type=float, default=0.0, help="限制 PyTorch CUDA 分配预算；0 不限制，例如 0.85 留出驱动和桌面显存")
     g.add_argument("--autotune", action="store_true", help="为固定形状搜索更快的矩阵和注意力内核；首次启动编译更久")
+    g.add_argument("--attention-backend", choices=["flex", "cudnn"], default="flex", help="flex：FlexAttention 窗口内核；cudnn：NVIDIA cuDNN 原生窗口前向和反向（要装 .[cudnn]）")
     args = p.parse_args(argv)
+    if args.eval_batch_size < 0 or args.eval_micro_batch_size < 0:
+        p.error("验证批大小必须是正数，或用 0 跟随训练批大小")
     if not args.cooldown_from:  # 退火分支的默认值要读了存档才知道，在 train 里补
         for key, value in DEFAULTS.items():
             if getattr(args, key) is None:

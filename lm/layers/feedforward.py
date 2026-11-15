@@ -18,7 +18,10 @@ class FeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = self.fc(x)
-        if hidden.is_cuda and LigerReLUSquaredFunction is not None:
+        if torch.compiler.is_compiling():
+            # 让 Inductor 联合搜索 GEMM 与激活的融合实现，包括反向 epilogue。
+            hidden = F.relu(hidden).square()
+        elif hidden.is_cuda and LigerReLUSquaredFunction is not None:
             hidden = LigerReLUSquaredFunction.apply(hidden)
         else:
             hidden = F.relu(hidden).square()

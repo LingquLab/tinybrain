@@ -1,12 +1,16 @@
 """因果自注意力：分组查询（GQA）、查询和键先归一化（QK-norm）、旋转位置编码，可选只看最近 window 个词。
 
 三条计算路径：
-  1. CUDA 上训练和整段前向：FlexAttention。窗口和因果写成一条掩码规则，编成块稀疏的掩码，只算窗口里的那条带子；
+  1. CUDA 上训练和整段前向：默认 FlexAttention。窗口和因果写成一条掩码规则，编成块稀疏的掩码，只算窗口里的那条带子；
      原生支持分组查询，不复制键值。头宽小于 16 时退回第 2 条。
+     也可以换成 NVIDIA cuDNN 原生的因果/滑动窗口内核（--attention-backend cudnn，要装 .[cudnn]）。
   2. CPU、MPS：scaled_dot_product_attention。窗口层带一张 T×T 的掩码（只在小模型和短序列上用，简单优先）。
   3. 逐词生成：新来的一个词和缓存里的键值算，窗口层的缓存只留最近 W 个。
 CUDA 训练时 Q、K、V 三个投影合成一次矩阵乘法，参数和存档里仍是三组权重。
 """
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +22,22 @@ from .rotary import apply_rotary_qk
 
 _flex_attention = torch.compile(flex_attention, fullgraph=True, dynamic=False,
                                 options={"triton.cudagraphs": False})
+
+_cudnn_attention = None
+_cudnn_dll_directories = []
+
+
+def prepare_cudnn_attention():
+    """在编译前注册 NVIDIA 的窗口 SDPA 前向和反向算子。"""
+    global _cudnn_attention
+    if _cudnn_attention is None:
+        if os.name == "nt":
+            _cudnn_dll_directories.append(os.add_dll_directory(str(Path(torch.__file__).parent / "lib")))
+        try:
+            import cudnn
+            _cudnn_attention = cudnn.sdpa_torch
+        except ImportError as exc:
+            raise RuntimeError("cuDNN 窗口注意力需要 nvidia-cudnn-frontend>=1.32.3；安装 .[cudnn]。") from exc
 
 
 def grouped_attention(q, k, v, *, attn_mask=None, is_causal=False):
@@ -44,9 +64,12 @@ class Attention(nn.Module):
         self._flex_mask = None
         self._flex_length = 0
         self.fuse_qkv = True
+        self.backend = "flex"
 
     def prepare(self, length, device):
         """在编译前构建稀疏块掩码；同一形状的训练步复用它。"""
+        if self.backend == "cudnn":
+            return
         if self._flex_length == length and self._flex_mask is not None:
             if self._flex_mask.kv_indices.device == torch.device(device):
                 return
@@ -62,6 +85,12 @@ class Attention(nn.Module):
 
     def attend(self, q, k, v):
         length = q.size(-2)
+        if q.is_cuda and self.backend == "cudnn":
+            # left_bound 排除 q-window 及更早的位置，与 Flex 的 q-k < window 相同。
+            # 反向需要前向的 log-sum-exp；由官方自定义算子负责保存和复用。
+            return _cudnn_attention(q, k, v, is_causal=True,
+                                    window_left=self.window if self.window is not None else -1,
+                                    return_lse=True)[0]
         if q.is_cuda and q.size(-1) >= 16:
             if self._flex_length != length or self._flex_mask is None:
                 self.prepare(length, q.device)

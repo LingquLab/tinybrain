@@ -18,6 +18,21 @@ from training.trainer_utils import find_stage, load_model, pick_device
 from .tokenizer import DEFAULT_MODEL, Tokenizer
 
 
+DEFAULT_TEMPERATURE = 0.8
+DEFAULT_TOP_K = 50
+
+
+def sampling_generator(device: torch.device, seed: int) -> torch.Generator | None:
+    """CPU、CUDA 都使用对应设备的随机数生成器，让固定种子的评测可复现。"""
+    return torch.Generator(device=device).manual_seed(seed) if device.type in ("cpu", "cuda") else None
+
+
+def prompt_ids(tok: Tokenizer, prompt: str) -> list[int]:
+    """续写用的提示：开头放一个文档结束符，意思是「上一篇完了，这里是新一篇的开头」。
+    训练数据里每篇的开头前面都是它；不放的话，模型会把提示当成从某篇文章中间截出来的一段，短提示尤其容易接歪。"""
+    return [tok.eos_id] + tok.encode(prompt)
+
+
 def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None,
                 generator: torch.Generator | None = None) -> torch.Tensor:
     """logits: (B, 词表) → (B, 1) 选中的词。temperature 为 0 时直接取最大的。"""
@@ -25,8 +40,8 @@ def sample_next(logits: torch.Tensor, temperature: float = 1.0, top_k: int | Non
         return logits.argmax(dim=-1, keepdim=True)
     logits = logits / temperature
     if top_k is not None:
-        kth = logits.topk(min(top_k, logits.size(-1)), dim=-1).values[:, -1:]
-        logits = logits.masked_fill(logits < kth, float("-inf"))
+        values, indices = logits.topk(min(top_k, logits.size(-1)), dim=-1)
+        logits = torch.full_like(logits, float("-inf")).scatter(-1, indices, values)
     if top_p is not None:
         ordered, order = logits.sort(dim=-1, descending=True)
         probs = F.softmax(ordered, dim=-1)
@@ -39,7 +54,7 @@ _FAST = weakref.WeakKeyDictionary()  # 每个模型一个 FastGenerator，编译
 
 
 @torch.no_grad()
-def generate(model: LanguageModel, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int | None = None,
+def generate(model: LanguageModel, idx: torch.Tensor, max_new_tokens: int, temperature: float = DEFAULT_TEMPERATURE, top_k: int | None = DEFAULT_TOP_K,
              top_p: float | None = None, eos_id: int | Iterable[int] | None = None, generator: torch.Generator | None = None,
              fast: bool | None = None) -> torch.Tensor:
     """idx: (B, T) 的提示。返回提示加上新生成的词。到了长度上限，或者每一行都出过停止符（eos_id，可以给一个或几个），就停。
@@ -74,23 +89,17 @@ def generate(model: LanguageModel, idx: torch.Tensor, max_new_tokens: int, tempe
 DEMO_PROMPTS = ["床前明月光，", "北京是中国的", "人工智能是", "def fibonacci(n):", "The capital of France is"]
 
 
-def prompt_ids(tok: Tokenizer, prompt: str) -> list[int]:
-    """续写用的提示：开头放一个文档结束符，意思是「上一篇完了，这里是新一篇的开头」。
-    训练数据里每篇的开头前面都是它；不放的话，模型会把提示当成从某篇文章中间截出来的一段，短提示尤其容易接歪。"""
-    return [tok.eos_id] + tok.encode(prompt)
-
-
 def _continue(model, tok: Tokenizer, prompt: str, max_new: int, temperature: float, top_k: int | None, seed: int) -> str:
     dev = next(model.parameters()).device
     ids = torch.tensor([prompt_ids(tok, prompt)], device=dev)
-    gen = torch.Generator(device="cpu").manual_seed(seed) if temperature else None
-    out = generate(model, ids, max_new, temperature=temperature, top_k=top_k, eos_id=tok.eos_id, generator=gen if dev.type == "cpu" else None)
+    gen = sampling_generator(dev, seed) if temperature else None
+    out = generate(model, ids, max_new, temperature=temperature, top_k=top_k, eos_id=tok.eos_id, generator=gen)
     return tok.decode(out[0, ids.size(1):].tolist())
 
 
-def continue_text(ckpt: str, prompt: str, max_new: int = 100, temperature: float = 0.0, top_k: int | None = 50,
+def continue_text(ckpt: str, prompt: str, max_new: int = 100, temperature: float = DEFAULT_TEMPERATURE, top_k: int | None = DEFAULT_TOP_K,
                   device: str = "auto", tokenizer: str | None = None, seed: int = 0) -> str:
-    """返回模型接在 prompt 后面写出的文字（不含 prompt 本身）。temperature 为 0 时每步取概率最大的词。"""
+    """返回模型接在 prompt 后面写出的文字（不含 prompt 本身）。默认在前 50 名内按温度 0.8 采样；temperature=0 才每步取概率最大的词。"""
     model = load_model(ckpt, pick_device(device))
     return _continue(model, Tokenizer(tokenizer or DEFAULT_MODEL), prompt, max_new, temperature, top_k, seed)
 
@@ -101,8 +110,8 @@ def parse_args(argv=None):
     parser.add_argument("--run", default="out/small", help="运行目录")
     parser.add_argument("--prompt", default=None, help="开头；不写就续写几个内置的开头")
     parser.add_argument("--max-new", type=int, default=100)
-    parser.add_argument("--temperature", type=float, default=0.8, help="0 是每步取概率最大的词（小模型容易陷进重复）")
-    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="默认 0.8；0 是每步取概率最大的词（小模型容易陷进重复）")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="只在概率最高的 k 个词中采样，默认 50")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     return parser.parse_args(argv)

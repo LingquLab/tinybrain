@@ -4,7 +4,7 @@
     tinybrain benchmarks run out/small/sft/ckpt.pt --bench ceval cmmlu gsm8k --chat --out out/small/sft/bench.json
 
 选择题：比较模型在「答案：」后面写 A、B、C、D 的概率，取最大的那个。不用生成，所以基座模型也能测。
-GSM8K：贪心生成解答，取最终答案和标准答案比，判分和数学 RLVR 是同一套（training/rewards/math.py）。
+GSM8K：默认温度 0.8、top-k 50 采样生成解答，取最终答案和标准答案比，判分和数学 RLVR 是同一套（training/rewards/math.py）。
 --chat：题目放进对话的 user 轮次（SFT 之后的模型用）；不加时直接接在文本后面（基座模型用）。
 --shots k：题目前面先放 k 道例题。选择题用同一科目的开发集，GSM8K 用训练集。
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import torch
 
-from inference.generate import generate
+from inference.generate import DEFAULT_TEMPERATURE, DEFAULT_TOP_K, generate, prompt_ids, sampling_generator
 from inference.template import ChatFormat
 from inference.tokenizer import DEFAULT_MODEL, Tokenizer
 from training.trainer_utils import load_model, pick_device
@@ -143,8 +143,10 @@ def _gsm8k_shots(shots: list[dict]) -> str:
 
 
 @torch.no_grad()
-def gsm8k_accuracy(model, fmt: ChatFormat, items: list[dict], dev: list[dict], shots: int = 0, chat: bool = False, max_new: int = 384) -> dict:
+def gsm8k_accuracy(model, fmt: ChatFormat, items: list[dict], dev: list[dict], shots: int = 0, chat: bool = False, max_new: int = 384,
+                   temperature: float = DEFAULT_TEMPERATURE, top_k: int | None = DEFAULT_TOP_K, seed: int = 0) -> dict:
     device = next(model.parameters()).device
+    generator = sampling_generator(device, seed)
     right, skipped = 0, 0
     for item in items:
         if chat:
@@ -152,13 +154,14 @@ def gsm8k_accuracy(model, fmt: ChatFormat, items: list[dict], dev: list[dict], s
             if len(fmt.prompt(messages)) + 16 > model.cfg.max_seq_len:
                 skipped += 1
                 continue
-            text = sample_group(model, fmt, messages, 1, max_new, temperature=0)[0].text
+            text = sample_group(model, fmt, messages, 1, max_new, temperature=temperature, top_k=top_k, generator=generator)[0].text
         else:
-            prompt = fmt.tok.encode(_gsm8k_shots(dev[:shots]) + f"问题：{item['question']}\n解答：")
+            prompt = prompt_ids(fmt.tok, _gsm8k_shots(dev[:shots]) + f"问题：{item['question']}\n解答：")
             if len(prompt) + 16 > model.cfg.max_seq_len:
                 skipped += 1
                 continue
-            out = generate(model, torch.tensor([prompt], device=device), max_new, temperature=0)
+            out = generate(model, torch.tensor([prompt], device=device), max_new, temperature=temperature,
+                           top_k=top_k, eos_id=fmt.tok.eos_id, generator=generator)
             text = fmt.tok.decode(out[0, len(prompt):].tolist()).split("\n\n问题：")[0]
         right += same_answer(extract_answer(text), item["answer"])
     n = len(items) - skipped
@@ -166,7 +169,8 @@ def gsm8k_accuracy(model, fmt: ChatFormat, items: list[dict], dev: list[dict], s
 
 
 def run_benchmarks(model, fmt: ChatFormat, benches=("ceval", "cmmlu", "gsm8k"), limit: int | None = None, shots: int = 0, chat: bool = False,
-                   bench_dir: Path = BENCH_DIR, max_new: int = 384) -> dict:
+                   bench_dir: Path = BENCH_DIR, max_new: int = 384,
+                   temperature: float = DEFAULT_TEMPERATURE, top_k: int | None = DEFAULT_TOP_K, seed: int = 0) -> dict:
     """limit：每个基准最多评前多少道（按科目均匀取，免得只测到排在前面的几科）。"""
     report = {}
     for bench in benches:
@@ -175,7 +179,7 @@ def run_benchmarks(model, fmt: ChatFormat, benches=("ceval", "cmmlu", "gsm8k"), 
             step = len(items) / limit
             items = [items[int(i * step)] for i in range(limit)]
         if bench == "gsm8k":
-            report[bench] = gsm8k_accuracy(model, fmt, items, dev, shots, chat, max_new)
+            report[bench] = gsm8k_accuracy(model, fmt, items, dev, shots, chat, max_new, temperature, top_k, seed)
         else:
             report[bench] = choice_accuracy(model, fmt, items, dev, shots, chat)
     return report
@@ -192,6 +196,9 @@ def main(argv=None):
     r.add_argument("--shots", type=int, default=0)
     r.add_argument("--chat", action="store_true")
     r.add_argument("--max-new", type=int, default=384)
+    r.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    r.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    r.add_argument("--seed", type=int, default=0)
     r.add_argument("--device", default="auto")
     r.add_argument("--out", default=None)
     args = parser.parse_args(argv)
@@ -200,12 +207,14 @@ def main(argv=None):
         return
     device = pick_device(args.device)
     model = load_model(Path(args.ckpt), device).eval()
-    report = run_benchmarks(model, ChatFormat(Tokenizer(DEFAULT_MODEL)), args.bench, args.limit, args.shots, args.chat, max_new=args.max_new)
+    report = run_benchmarks(model, ChatFormat(Tokenizer(DEFAULT_MODEL)), args.bench, args.limit, args.shots, args.chat, max_new=args.max_new,
+                            temperature=args.temperature, top_k=args.top_k, seed=args.seed)
     for bench, r in report.items():
         print(f"{bench:<6} 准确率 {r['acc']:.2%}（{r['n']} 道，跳过 {r['skipped']} 道）")
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).write_text(json.dumps(dict(ckpt=args.ckpt, chat=args.chat, shots=args.shots, **report), ensure_ascii=False, indent=1), encoding="utf-8")
+        Path(args.out).write_text(json.dumps(dict(ckpt=args.ckpt, chat=args.chat, shots=args.shots,
+            sampling=dict(temperature=args.temperature, top_k=args.top_k, seed=args.seed), **report), ensure_ascii=False, indent=1), encoding="utf-8")
     return report
 
 

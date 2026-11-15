@@ -15,7 +15,7 @@ _SAVED_OPS = {
 
 
 def _policy(ctx, op, *args, **kwargs):
-    if op in _SAVED_OPS or str(op) == "flex_attention":
+    if op in _SAVED_OPS or str(op) in ("flex_attention", "cudnn.sdpa_fwd.default"):
         return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
 

@@ -11,9 +11,10 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 - **后训练做全套**：SFT → 领域专家 → 多老师在线蒸馏（MOPD）→ 强化学习（RLVR、agent RL、RLAIF），10 种题型、各自的判分器。
 - **以中文为主**：分词器、数据配比、评分细则都按中文定，另外专门放了古文、诗词、鲁迅全集。
 
-> **现状（2026-11-14）**：模型、数据流水线、四档预训练数据、整套后训练（SFT、MOPD、RL）和评测都写完了，有测试；
+> **现状（2026-11-15）**：模型、数据流水线、四档预训练数据、整套后训练（SFT、MOPD、RL）和评测都写完了，有测试；
 > 在一个 2300 万参数的演示模型上，用最终的数据把整条链（预训练 → 退火 → SFT → agent RL → RLAIF → 专家 → RLVR → MOPD → 评测）跑通过。
-> **small 正在 RTX 5070 Ti 16GB 上正式预训练**：2048 × 16 配置稳态约 7.1 万 token/秒、0.46 秒/步；采样到的进程专用显存峰值约 12.54 GiB。CUDA 路径已做输出、梯度、优化器恢复和完整训练步验证。训练仍在早期，生成质量尚未成熟。
+> **small 已暂停，保留第 82,500 步存档，转向 medium（499M）**。small 的 2048 × 16 配置曾达到稳态约 7.1 万 token/秒、0.46 秒/步，进程专用显存峰值约 12.54 GiB。训练仍在早期，生成质量尚未成熟。
+> medium 已从头开始训练：2048 长度、微批 4 × 累积 4，真实训练稳态约 2.59 万 token/秒、1.26 秒/完整一步。Windows 30 次采样的专用显存峰值约 12.44 GiB、共享显存约 82 MiB；30 步独立 bench 的 PyTorch reserved 峰值约 13.33 GiB。
 
 ---
 
@@ -583,6 +584,13 @@ CUDA 训练加速使用 **Liger Kernel 0.8.5+**（融合输出层交叉熵、静
 
 CUDA 训练时把 Q、K、V 投影合并成一次矩阵乘法，参数和检查点中仍分别保存三组权重。验证和带缓存的生成保留原来的投影路径。
 
+medium 在 16GB 显卡上用微批 4、梯度累积 4，完整一步仍处理 16 × 2048 = 32,768 个词，实测约 2.59 万 token/秒（1.26 秒一步），专用显存峰值约 12.4 GiB。可以装 `pip install -e ".[cudnn]"`（`nvidia-cudnn-frontend>=1.32.3,<1.33`，要 PyTorch 2.13+），用 `--attention-backend cudnn` 换成 NVIDIA 原生的滑动窗口/GQA 前向和反向；默认仍是 FlexAttention。编译路径还把 mHC 读流和 RMSNorm 融在一起，并让 FFN 的矩阵乘法和 ReLU² 一起搜索融合方式；模型结构、词表和优化器状态的精度不变。`--gpu-memory-fraction` 在建模型之前给 PyTorch 设显存上限。验证的抽样批大小（`--eval-batch-size`）和实际前向的微批（`--eval-micro-batch-size`）分开指定：换了训练微批，验证片段仍和以前一样，历史损失可以直接比。
+
+```bash
+tinybrain pretrain --data data/tokens/base --out out/medium/pretrain --preset medium --seq-len 2048 --batch-size 4 --grad-accum 4 --epochs 1 --autotune --attention-backend cudnn --gpu-memory-fraction 0.85 --checkpoint-policy selective --eval-batch-size 16 --eval-micro-batch-size 4 --log-every 50
+tinybrain bench medium --batch 4 --grad-accum 4 --seq 2048 --autotune --attention-backend cudnn --gpu-memory-fraction 0.85
+```
+
 Windows 默认编码为 GBK 时，先设 `$env:PYTHONUTF8 = 1`（PowerShell）再运行 `tinybrain …`，或者用 `python -X utf8 -m tools.bench small --batch 8 --seq 4096`。如果 Triton 默认缓存目录报路径错误，可在 PowerShell 中先设置 `$env:TRITON_CACHE_DIR = "$PWD\.cache\triton"` 和 `$env:TORCHINDUCTOR_CACHE_DIR = "$PWD\.cache\inductor"`。
 
 训练中也可以接入 TensorBoard：安装 `pip install -e ".[monitor]"`，运行 `tinybrain tensorboard --run out/small/pretrain`，再运行 `python -m tensorboard.main --logdir out/small/pretrain/tensorboard --host 127.0.0.1 --port 6006`，打开 `http://127.0.0.1:6006`。同步工具会补录已有 JSONL 指标并持续追加训练/验证损失、各参数组学习率、吞吐和进度；不需要重启训练。历史数据的横轴使用训练步数。
@@ -598,8 +606,8 @@ tinybrain benchmarks run out/small/pretrain/ckpt.pt --shots 5            # 基�
 ```
 
 - **留出集损失**：按类别（中文、百科、代码、数学、古文……）看后训练有没有把预训练学到的东西训坏；
-- **题目正确率**：每种 RL 题型留出的评测题，贪心作答，用同一套判分；
-- **标准基准**：C-Eval（验证集）、CMMLU 比较「答案：」后面四个选项字母的概率（不用生成，基座模型也能测）；GSM8K 贪心生成后对答案；
+- **题目正确率**：每种 RL 题型留出的评测题，默认温度 0.8、前 50 名里采样作答（种子固定，可复现；`--temperature 0` 改回贪心），用同一套判分；
+- **标准基准**：C-Eval（验证集）、CMMLU 比较「答案：」后面四个选项字母的概率（不用生成，基座模型也能测）；GSM8K 同样默认采样生成后对答案；
 - **固定提问**：每个阶段对同一组问题作答，放在一起给人看。
 
 C-Eval 是 CC BY-NC-SA 4.0、CMMLU 是 CC BY-NC 4.0，只下载到本地评测，不随仓库或数据集发布。
@@ -612,6 +620,8 @@ C-Eval 是 CC BY-NC-SA 4.0、CMMLU 是 CC BY-NC 4.0，只下载到本地评测�
 tinybrain chat --tools                         # 命令行对话：默认用 out/small 里走得最远的存档；--tools 打开计算器和 Python
 tinybrain serve out/small/rl/ckpt.pt --port 8001  # OpenAI 兼容的 /v1/chat/completions，支持工具调用
 ```
+
+续写和生成式评测默认温度 0.8、只在概率最高的 50 个词里采样；`tinybrain generate`、`tinybrain eval`、`tinybrain benchmarks run` 都可以用 `--temperature`、`--top-k`、`--seed` 改，默认种子 0，评测结果里记下采样参数。`--temperature 0` 是每步取概率最大的词。预训练续写在提示前加文档结束符，生成出结束符就停。
 
 CUDA 上生成走静态缓存：键值缓存按最大长度预先分配，每一步原地写入，形状完全固定，整步用 `torch.compile(mode="reduce-overhead")` 录成 CUDA graph（gpt-fast 的做法）。CPU、MPS 上走普通的带缓存生成，两条路径结果一样（有测试对照）。
 
@@ -638,7 +648,7 @@ CUDA 上生成走静态缓存：键值缓存按最大长度预先分配，每一
 
 ## 还没做的
 
-- small 正在 RTX 5070 Ti 上预训练，训完补上样例对话和评测分数；medium、large 还没训；
+- medium 正在 RTX 5070 Ti 上预训练（small 停在第 82,500 步），训完补上样例对话和评测分数；large 还没训；
 - 评分细则和人工打分对比校准；
 - 古文、诗词的专门评测；MMLU、MATH-500、HumanEval、MBPP、IFEval 这些基准；
 - large 接小米开源的 MiMo agent 环境（通过 `inference/serve.py` 的 OpenAI 兼容接口）；

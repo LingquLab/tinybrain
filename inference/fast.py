@@ -14,7 +14,7 @@ from lm import LanguageModel
 from lm.layers.hyper import read_streams, write_streams
 from lm.layers.rotary import apply_rotary
 
-from .generate import sample_next
+from .generate import DEFAULT_TEMPERATURE, DEFAULT_TOP_K, sample_next
 
 
 class StaticState:
@@ -82,7 +82,7 @@ class FastGenerator:
         self.step = torch.compile(forward_static, mode="reduce-overhead", fullgraph=False) if self.compiled else forward_static
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None,
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = DEFAULT_TEMPERATURE, top_k: int | None = DEFAULT_TOP_K, top_p: float | None = None,
                  eos_id=None, generator: torch.Generator | None = None) -> torch.Tensor:
         """和 inference.generate.generate 一样的用法和结果。"""
         model, device = self.model, idx.device

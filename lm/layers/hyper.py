@@ -96,6 +96,19 @@ def read_streams(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
     return torch.einsum("btnd,n->btd", x, pre)
 
 
+def read_normalized_streams(x, pre, norm):
+    """编译时融合读流和 RMSNorm，避免把合流结果往显存写回再读出。"""
+    if not (x.is_cuda and x.dtype != torch.float64 and torch.compiler.is_compiling()):
+        return norm(read_streams(x, pre))
+    dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
+    x = x.to(dtype)
+    # 展开后再归约，与静态系数的参数化一致；显式保留读流处的精度转换。
+    pre = pre.expand(*x.shape[:-2], x.size(-2))
+    mixed = (x.float() * pre.float().unsqueeze(-1)).sum(-2).to(dtype).float()
+    eps = norm.eps if norm.eps is not None else torch.finfo(dtype).eps
+    return (mixed * torch.rsqrt(mixed.square().mean(-1, keepdim=True) + eps) * norm.weight.float()).to(dtype)
+
+
 def write_streams(x: torch.Tensor, out: torch.Tensor, res: torch.Tensor, post: torch.Tensor) -> torch.Tensor:
     """x: (B, T, n, d)，out: (B, T, d)，res: (n, n)，post: (n) → (B, T, n, d)"""
     if LigerMHCPostResFunction is not None and x.is_cuda and x.dtype != torch.float64:

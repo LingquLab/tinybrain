@@ -41,13 +41,21 @@ def autocast(device: torch.device):
 
 
 def compile_model(model: torch.nn.Module, device: torch.device, enabled: bool = True, seq_len: int | None = None,
-                  autotune: bool = False) -> torch.nn.Module:
+                  autotune: bool = False, attention_backend: str = "flex") -> torch.nn.Module:
     """CUDA 上编译前向；激活重计算时逐层编译，保留层间的释放边界。MoE 不编译。"""
+    if attention_backend not in ("flex", "cudnn"):
+        raise ValueError(f"未知注意力后端：{attention_backend}")
+    if attention_backend == "cudnn":
+        if device.type != "cuda":
+            raise ValueError("cuDNN 注意力要求 CUDA")
+        from lm.layers.attention import prepare_cudnn_attention
+        prepare_cudnn_attention()
     if device.type == "cuda":
         from lm.loss import LigerFusedLinearCrossEntropyFunction
         if LigerFusedLinearCrossEntropyFunction is None:
             raise RuntimeError("CUDA 加速需要 liger-kernel>=0.8.5；Linux 安装 .[cuda]，Windows 配好 triton-windows 后用 --no-deps 安装 liger-kernel。")
         for block in model.blocks:
+            block.attn.backend = attention_backend
             block.attn.prepare(seq_len or block.attn._flex_length or model.cfg.max_seq_len, device)
     if not enabled or device.type != "cuda" or getattr(getattr(model, "cfg", None), "moe_experts", 0):
         return model
