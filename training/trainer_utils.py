@@ -107,11 +107,28 @@ def count(n: float) -> str:
 # ---------- 学习率
 
 def lr_scale(step: int, total_steps: int, warmup_steps: int, final_frac: float = 0.1) -> float:
-    """第 step 步（从 0 数）的学习率是起步值的几倍：先线性预热，再按余弦降到 final_frac。"""
+    """第 step 步（从 0 数）的学习率是起步值的几倍：先线性预热，再按余弦降到 final_frac。WSD 见 wsd_scale。"""
     if step < warmup_steps:
         return (step + 1) / warmup_steps
     progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
     return final_frac + (1 - final_frac) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def decay_scale(step: int, start: int, steps: int, high: float, low: float, shape: str = "sqrt") -> float:
+    """从第 start 步起，用 steps 步把学习率倍数从 high 降到 low，最后一步（start + steps − 1）正好是 low；start 之前是 high。
+    shape：sqrt 按 1 − √p 降（先快后慢；Hägele 等 2024 的比较里比直线好），linear 是直线。"""
+    if step < start:
+        return high
+    p = min(1.0, (step - start + 1) / max(1, steps))
+    return high - (high - low) * (math.sqrt(p) if shape == "sqrt" else p)
+
+
+def wsd_scale(step: int, total_steps: int, warmup_steps: int, decay_steps: int, final_frac: float = 0.1, shape: str = "sqrt") -> float:
+    """WSD（预热、恒定、退火）：先线性预热，再一直保持 1，最后 decay_steps 步降到 final_frac。
+    和余弦相比，恒定段的任何一个存档都可以分出去单独退火（train_pretrain --cooldown-from），不用事先定死总长度。"""
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    return decay_scale(step, total_steps - decay_steps, decay_steps, 1.0, final_frac, shape)
 
 
 def set_lr_scale(optimizers: list[torch.optim.Optimizer], scale: float) -> None:
@@ -222,7 +239,9 @@ def clip_gradients(params, max_norm: float) -> torch.Tensor | None:
     """把梯度的总范数裁到 max_norm 以内，返回裁剪前的总范数（记进日志）；max_norm 为 0 时不裁、返回 None。"""
     if not max_norm:
         return None
-    return torch.nn.utils.clip_grad_norm_(list(params), max_norm, foreach=True)
+    params = list(params)
+    # foreach 是一次处理一批张量的快速实现；MPS 上 PyTorch 不支持，硬要用会报错，交给 PyTorch 自己选
+    return torch.nn.utils.clip_grad_norm_(params, max_norm, foreach=True if params and params[0].is_cuda else None)
 
 
 def step_optimizers(optimizers: list[torch.optim.Optimizer]) -> None:

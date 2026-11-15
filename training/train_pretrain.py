@@ -7,12 +7,19 @@
     tinybrain pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_nano.parquet:0.9,data/tokens/chat-all:0.1 \\
         --steps 2000 --warmup-steps 0 --lr-mult 0.1 --final-lr-frac 0
 
+    # WSD：预热、恒定、最后 20% 的步数退火。恒定段的任何存档都能分出一支退火（主线不受影响），写到 out/small/cooldown-<步数>
+    tinybrain pretrain --schedule wsd
+    tinybrain pretrain --cooldown-from out/small/pretrain/ckpt.pt --cooldown-steps 3000
+
 --data 可以直接给 parquet，第一次用时自动切词，放在它旁边的 tokens/ 目录里（见 tools.prepare.ensure_tokens）；也可以给切好的目录。
 
 按轮数训（--epochs，默认 1）：数据切成不重叠的片段，每轮打乱一次依次取完，一轮里每个片段恰好看一遍；也可以直接给 --steps。
 日志里每一行都写着已经训了多少词（tokens）、多少轮（epoch），不用自己乘。
 输出目录里有 config.json（这次的全部参数）、log.jsonl（每隔几步一行）、ckpt.pt（最新的存档）。
 中断后加 --resume 接着跑：每一步用哪批数据只由种子和步数决定，所以接着跑和一口气跑完结果一样。
+学习率曲线：默认先预热再按余弦降（--schedule cosine）；--schedule wsd 是预热、恒定、最后 --decay-frac 的步数退火（1 − √p 的形状）。
+退火分支（--cooldown-from 存档 --cooldown-steps N）：连优化器状态一起从存档接着走，数据也接着主线往后取，
+学习率从主线在这一步本来的值，用 N 步降到 --final-lr-frac（不写就和主线一样）。--init 不一样：它只取模型参数，优化器从头开始。
 全部参数见文件末尾的 parse_args。
 """
 import argparse
@@ -27,10 +34,17 @@ import torch
 from lm import PRESETS, LanguageModel, ModelConfig, preset
 
 from .dataset import open_mixed
-from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, compile_model, count, format_eta, load_checkpoint, lr_scale, optimizers_from_args,
-                            pick_device, resume, saturated_share, save_checkpoint, set_lr_scale, setup_device, step_optimizers)
+from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, compile_model, count, decay_scale, format_eta, load_checkpoint, lr_scale,
+                            optimizers_from_args, pick_device, resume, saturated_share, save_checkpoint, set_lr_scale, setup_device, step_optimizers,
+                            wsd_scale)
 
 MODEL_ARGS = ("dim", "n_layers", "n_heads", "n_kv_heads", "max_seq_len", "window", "moe_experts")  # 命令行上能直接改的模型设置
+DEFAULTS = dict(data="data/pretrain_nano.parquet", seq_len=2048, batch_size=8, grad_accum=1, seed=0, final_lr_frac=0.1)
+# 退火分支不写这几项就取自存档；写了要和存档一样（数据可以换，比如混进对话数据），否则就不是接着主线走了
+COOLDOWN_INHERIT = ("data", "seq_len", "batch_size", "grad_accum", "seed")
+# 优化器的设置一律取自存档：加载优化器状态时学习率本来就会被存档里的值盖掉
+COOLDOWN_OPTIMIZER = ("optimizer", "lr_mult", "matrix_lr", "embed_lr", "head_lr", "engram_lr", "scalar_lr", "weight_decay", "adam_eps", "clip_grad",
+                      "muon_momentum", "offload_adam")
 
 
 def parse_overrides(pairs: list[str]) -> dict:
@@ -47,16 +61,57 @@ def parse_overrides(pairs: list[str]) -> dict:
     return out
 
 
-def build_model(args, vocab_size: int, device: torch.device) -> tuple[LanguageModel, str]:
-    """新建模型（预设 + 命令行上改的设置），或者从 --init 的存档出发（设置取自存档）。返回模型和一句说明。"""
-    changes = {k: getattr(args, k) for k in MODEL_ARGS if getattr(args, k) is not None} | parse_overrides(args.set)
+def schedule_of(args, total: int):
+    """学习率曲线：返回「第几步 → 起步值的几倍」。"""
+    if getattr(args, "schedule", "cosine") == "wsd":
+        decay = max(1, round(args.decay_frac * total))
+        return lambda step: wsd_scale(step, total, args.warmup_steps, decay, args.final_lr_frac, args.decay_shape)
+    return lambda step: lr_scale(step, total, args.warmup_steps, args.final_lr_frac)
+
+
+def setup_cooldown(args) -> tuple[dict, int, float]:
+    """--cooldown-from：读主线的存档，把没写的参数补成主线的。返回 (存档, 从第几步分出, 主线在这一步本来的学习率倍数)。"""
     if args.init:
+        raise ValueError("--cooldown-from 和 --init 不能一起用：--init 只取模型参数、优化器从头开始，--cooldown-from 连优化器状态一起接着走")
+    if not args.cooldown_steps:
+        raise ValueError("--cooldown-from 要配 --cooldown-steps：用多少步把学习率降下来")
+    path = Path(args.cooldown_from)
+    state = load_checkpoint(path, torch.device("cpu"))  # 先放内存：参数和优化器状态加载时才各自搬到设备上，显存里不会同时有两份
+    parent = argparse.Namespace(**{"schedule": "cosine", "decay_frac": 0.2, "decay_shape": "sqrt", **state.get("train_config", {})})
+    for key in COOLDOWN_INHERIT:
+        mine, theirs = getattr(args, key), getattr(parent, key, None)
+        if mine is None:
+            setattr(args, key, theirs)
+        elif key != "data" and mine != theirs:
+            raise ValueError(f"--{key.replace('_', '-')} 写的是 {mine}，主线的存档里是 {theirs}。退火分支要接着主线走，这一项要和主线一样（不写就取自存档）")
+    for key in COOLDOWN_OPTIMIZER:
+        if hasattr(parent, key):
+            setattr(args, key, getattr(parent, key))
+    start = state["step"]
+    if "next_lr_scale" in state:
+        high = state["next_lr_scale"]
+    else:  # 加 WSD 之前存的档：按主线的设置和总步数（存档旁边的 config.json）重算
+        config = path.parent / "config.json"
+        if not config.exists():
+            raise FileNotFoundError(f"{path} 是旧格式的存档，要靠旁边的 {config.name} 算出主线在第 {start} 步的学习率，但它不在")
+        high = schedule_of(parent, json.loads(config.read_text(encoding="utf-8"))["steps"])(start)
+    if args.final_lr_frac is None:
+        args.final_lr_frac = getattr(parent, "final_lr_frac", DEFAULTS["final_lr_frac"])
+    args.run = args.run or str(path.parent.parent)
+    args.out = args.out or str(Path(args.run) / f"cooldown-{start}")
+    return state, start, high
+
+
+def build_model(args, vocab_size: int, device: torch.device, parent: dict | None = None) -> tuple[LanguageModel, str]:
+    """新建模型（预设 + 命令行上改的设置），或者从 --init / --cooldown-from 的存档出发（设置取自存档）。返回模型和一句说明。"""
+    changes = {k: getattr(args, k) for k in MODEL_ARGS if getattr(args, k) is not None} | parse_overrides(args.set)
+    if args.init or parent is not None:
         if changes:
-            raise ValueError(f"从存档出发（--init）时模型设置取自存档，不能再改：{'、'.join(changes)}")
-        state = load_checkpoint(Path(args.init), device)
+            raise ValueError(f"从存档出发时模型设置取自存档，不能再改：{'、'.join(changes)}")
+        state = parent if parent is not None else load_checkpoint(Path(args.init), device)
         model = LanguageModel(ModelConfig.from_json(state["model_config"])).to(device)
         model.load_state_dict(state["model"])
-        origin = f"从 {args.init} 出发"
+        origin = f"从 {args.init} 出发" if parent is None else f"从 {args.cooldown_from} 第 {state['step']} 步分出的退火分支"
     else:
         model = LanguageModel(preset(args.preset, vocab_size, **changes)).to(device)
         origin = args.preset + ("（改了 " + "、".join(changes) + "）" if changes else "")
@@ -107,8 +162,9 @@ def tokens_for(spec: str) -> str:
 
 def train(args) -> dict:
     """跑完训练，返回 {"step", "loss", "val_loss", "tokens"}。"""
-    args.data = tokens_for(args.data)
     device = pick_device(args.device)
+    parent, branch_start, branch_high = setup_cooldown(args) if args.cooldown_from else (None, 0, 1.0)
+    args.data = tokens_for(args.data)
     setup_device(device)
     torch.manual_seed(args.seed)
     out = Path(args.out)
@@ -120,14 +176,22 @@ def train(args) -> dict:
         raise FileNotFoundError(f"{args.data} 里没有训练数据")
 
     # 模型和优化器
-    model, origin = build_model(args, train_data.vocab_size, device)
+    model, origin = build_model(args, train_data.vocab_size, device, parent)
     model.gradient_checkpointing = device.type == "cuda"
     model.checkpoint_policy = "selective"
     windows = train_data.windows(args.seq_len)
-    steps = total_steps(args, windows)
     rows_per_step = args.batch_size * args.grad_accum
     optimizers = optimizers_from_args(model, args)
-    start_step = resume(out / "ckpt.pt", model, optimizers, device) if args.resume else 0
+    if parent is not None:  # 退火分支：优化器状态接着主线，学习率从主线这一步的值降到底
+        steps = branch_start + args.cooldown_steps
+        for opt, opt_state in zip(optimizers, parent["optimizers"]):
+            opt.load_state_dict(opt_state)
+        schedule = lambda step: decay_scale(step, branch_start, args.cooldown_steps, branch_high, args.final_lr_frac, args.decay_shape)  # noqa: E731
+        del parent
+    else:
+        steps = total_steps(args, windows)
+        schedule = schedule_of(args, steps)
+    start_step = (resume(out / "ckpt.pt", model, optimizers, device) if args.resume else 0) or branch_start
     (out / "config.json").write_text(json.dumps({"train": vars(args), "steps": steps, "model": json.loads(model.cfg.to_json()), "data": train_data.meta},
                                                 ensure_ascii=False, indent=1), encoding="utf-8")
     forward = compile_model(model, device, enabled=not args.no_compile, seq_len=args.seq_len, autotune=args.autotune)
@@ -143,6 +207,8 @@ def train(args) -> dict:
     print(f"设备 {device}；模型 {origin}，共 {report['合计'] / 1e6:.1f}M 参数（主干 {report['主干'] / 1e6:.1f}M）；"
           f"数据 {count(train_data.n_tokens)} 词（每轮 {windows} 个片段）；共 {steps} 步 = {count(steps * tokens_per_step)} 词 = "
           f"{steps * rows_per_step / windows:.2f} 轮" + (f"，从第 {start_step} 步接着跑" if start_step else ""), flush=True)
+    if args.cooldown_from:
+        print(f"学习率在第 {branch_start + 1}～{steps} 步从 {branch_high:.3f} 倍降到 {args.final_lr_frac} 倍（{args.decay_shape}）", flush=True)
 
     # 训练循环
     model.train()
@@ -150,7 +216,7 @@ def train(args) -> dict:
     last_time, last_step = time.perf_counter(), start_step
     with open(out / "log.jsonl", "a", encoding="utf-8") as log:
         for step in range(start_step, steps):
-            scale = lr_scale(step, steps, args.warmup_steps, args.final_lr_frac)
+            scale = schedule(step)
             set_lr_scale(optimizers, scale * args.lr_mult)
             loss_value = 0.0
             for micro in range(args.grad_accum):  # 攒几个批次的梯度再更新一次
@@ -193,19 +259,19 @@ def train(args) -> dict:
                 log.write(json.dumps(record) + "\n")
                 log.flush()
             if done % args.save_every == 0 or done == steps:
-                save_checkpoint(out / "ckpt.pt", model, optimizers, done, train_config=vars(args))
+                save_checkpoint(out / "ckpt.pt", model, optimizers, done, train_config=vars(args), total_steps=steps, next_lr_scale=schedule(done))
     return dict(step=steps, loss=loss_value, val_loss=val_loss, tokens=(steps - start_step) * tokens_per_step)
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="预训练（也用来退火）")
     g = p.add_argument_group("数据和输出")
-    g.add_argument("--data", default="data/pretrain_nano.parquet",
-                   help="parquet（第一次用时自动切词）或切好的目录；可以写成「A:0.9,B:0.1」按比例混合")
+    g.add_argument("--data", default=None,
+                   help="parquet（第一次用时自动切词）或切好的目录；可以写成「A:0.9,B:0.1」按比例混合。默认 data/pretrain_nano.parquet，退火分支默认和主线一样")
     g.add_argument("--run", default=None, help="运行目录，各个阶段都放在这里；默认 out/<预设名>")
-    g.add_argument("--out", default=None, help="输出目录；默认 <运行目录>/pretrain，给了 --init 时是 <运行目录>/anneal")
-    g.add_argument("--seq-len", type=int, default=2048, help="每个片段多少个词")
-    g.add_argument("--batch-size", type=int, default=8, help="每个批次多少个片段")
+    g.add_argument("--out", default=None, help="输出目录；默认 <运行目录>/pretrain，给了 --init 时是 <运行目录>/anneal，退火分支是 <运行目录>/cooldown-<步数>")
+    g.add_argument("--seq-len", type=int, default=None, help="每个片段多少个词，默认 2048")
+    g.add_argument("--batch-size", type=int, default=None, help="每个批次多少个片段，默认 8")
 
     g = p.add_argument_group("模型（新建时用；--init 时设置取自存档，不能改）")
     g.add_argument("--preset", choices=list(PRESETS), default="small")
@@ -222,10 +288,17 @@ def parse_args(argv=None):
     g = p.add_argument_group("训练")
     g.add_argument("--epochs", type=float, default=1.0, help="把数据过几遍（可以是小数）；没给 --steps 时按它算")
     g.add_argument("--steps", type=int, default=0, help="一共更新多少次；给了就不看 --epochs")
-    g.add_argument("--grad-accum", type=int, default=1, help="攒几个批次的梯度再更新一次（显存不够时用它凑大批次）")
+    g.add_argument("--grad-accum", type=int, default=None, help="攒几个批次的梯度再更新一次（显存不够时用它凑大批次），默认 1")
     g.add_argument("--warmup-steps", type=int, default=100)
-    g.add_argument("--final-lr-frac", type=float, default=0.1, help="学习率最后降到起步值的几分之几")
-    g.add_argument("--seed", type=int, default=0)
+    g.add_argument("--final-lr-frac", type=float, default=None, help="学习率最后降到起步值的几分之几，默认 0.1；退火分支默认和主线一样")
+    g.add_argument("--seed", type=int, default=None, help="默认 0")
+    g.add_argument("--schedule", choices=["cosine", "wsd"], default="cosine", help="cosine：预热后按余弦降；wsd：预热、恒定、最后一段退火")
+    g.add_argument("--decay-frac", type=float, default=0.2, help="wsd：最后多大比例的步数用来退火")
+    g.add_argument("--decay-shape", choices=["sqrt", "linear"], default="sqrt", help="wsd 和退火分支降学习率的形状：sqrt 是 1 − √p，linear 是直线")
+
+    g = p.add_argument_group("退火分支（从主线的存档分出去退火，主线不受影响）")
+    g.add_argument("--cooldown-from", default=None, help="主线的存档；连优化器状态一起接着走，片段长度、批大小、优化器设置都取自它")
+    g.add_argument("--cooldown-steps", type=int, default=0, help="用多少步把学习率降到底")
     add_optimizer_args(p)
 
     g = p.add_argument_group("记录和存档")
@@ -241,8 +314,12 @@ def parse_args(argv=None):
     g.add_argument("--cuda-graph", action="store_true", help="捕获融合 Adam 和 Muon 更新图；只支持 CUDA 普通前馈模型、自定义 Muon")
     g.add_argument("--autotune", action="store_true", help="为固定形状搜索更快的矩阵和注意力内核；首次启动编译更久")
     args = p.parse_args(argv)
-    args.run = args.run or f"out/{args.preset}"
-    args.out = args.out or str(Path(args.run) / ("anneal" if args.init else "pretrain"))
+    if not args.cooldown_from:  # 退火分支的默认值要读了存档才知道，在 train 里补
+        for key, value in DEFAULTS.items():
+            if getattr(args, key) is None:
+                setattr(args, key, value)
+        args.run = args.run or f"out/{args.preset}"
+        args.out = args.out or str(Path(args.run) / ("anneal" if args.init else "pretrain"))
     return args
 
 

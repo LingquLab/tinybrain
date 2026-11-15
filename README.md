@@ -135,7 +135,7 @@ lm/                    模型的定义，只有模型（一个文件一个概念
   loss.py                输出层加交叉熵（CUDA 上用 Liger 的融合内核，否则分块算；不会塌缩的写法）
   checkpointing.py       逐层激活重计算
 training/              训练；每个阶段一个脚本，从头读到尾就是这个阶段的全部，参数都在文件末尾的 parse_args 里
-  train_pretrain.py      预训练（也用于退火：--init 从存档出发，--data 按比例混合几份数据）
+  train_pretrain.py      预训练（也用于退火：--init 从存档出发，--data 按比例混合几份数据；--schedule wsd、--cooldown-from 分支退火）
   train_sft.py           SFT：只在回答上算损失（通用 SFT 和领域专家都用它）
   train_distill.py       MOPD：多老师在线蒸馏，按领域路由到老师
   train_rl.py            GRPO（Dr. GRPO）：RLVR、agent RL、RLAIF 共用
@@ -427,6 +427,21 @@ X_0 = U / \lVert U \rVert,\qquad A = X X^\top,\qquad X \leftarrow aX + (bA + cA^
 ```
 
 每组的学习率 = 起步值 × scale(t) × `--lr-mult`。
+
+`--schedule wsd` 换成 WSD（预热、恒定、退火）：预热之后一直保持 1，最后 $`T_d`$ 步（`--decay-frac`，默认 0.2）按 $`1-\sqrt{p}`$ 降到 $`f`$：
+
+```math
+\text{scale}(t) = \begin{cases} \dfrac{t+1}{T_w} & t < T_w \\[2mm] 1 & T_w \le t < T - T_d \\[2mm] 1 - (1-f)\sqrt{p},\quad p = \dfrac{t - (T - T_d) + 1}{T_d} & t \ge T - T_d \end{cases}
+```
+
+余弦要在开始时定死总步数；WSD 的恒定段里，任何一个存档都能分出一支单独退火，主线接着训。这样训到一半就能拿到一个退过火、能用的模型，再决定要不要训满。短退火能达到和余弦相当的效果，见 Hägele 等 2024，*Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations*。
+
+```bash
+tinybrain pretrain --schedule wsd                                                  # 主线
+tinybrain pretrain --cooldown-from out/small/pretrain/ckpt.pt --cooldown-steps 3000   # 分支 → out/small/cooldown-<步数>
+```
+
+退火分支连优化器状态一起接着主线走，数据也接着主线往后取；学习率从主线在这一步本来的值降到 `--final-lr-frac`（不写就和主线一样）。片段长度、批大小、优化器设置都取自存档。余弦训练的存档也能分支，可以用来量「现在退火能降多少」。和[退火](#退火)那一步的 `--init` 不同：`--init` 只取模型参数，优化器从头开始。
 
 ---
 
