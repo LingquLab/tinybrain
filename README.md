@@ -6,7 +6,7 @@
 [![数据集 ModelScope](https://img.shields.io/badge/%E6%95%B0%E6%8D%AE%E9%9B%86-ModelScope-ffd21f)](https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset)
 [![视频 B 站](https://img.shields.io/badge/%E8%A7%86%E9%A2%91-B%20%E7%AB%99-fb7299)](https://www.bilibili.com/video/BV1kqsj6EEtT/)
 [![模型 训练中](https://img.shields.io/badge/%E6%A8%A1%E5%9E%8B-%E8%AE%AD%E7%BB%83%E4%B8%AD-lightgrey)](#现状)
-[![GitHub stars](https://img.shields.io/github/stars/cai114514114514/tinybrain?color=15965a)](https://github.com/cai114514114514/tinybrain/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/logitcai/tinybrain?color=15965a)](https://github.com/logitcai/tinybrain/stargazers)
 
 **从一个字开始，自己做一个中文大模型。**
 
@@ -72,7 +72,7 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 **第 0 步：装好**
 
 ```bash
-git clone https://github.com/cai114514114514/tinybrain && cd tinybrain
+git clone https://github.com/logitcai/tinybrain && cd tinybrain
 pip install -e ".[data]"          # 要 Python 3.11+、PyTorch 2.5+（用 PyTorch 自带的 Muon 要 2.9+）；装完就有 tinybrain 命令
 pip install -e ".[cuda,fast]"     # 可选：N 卡训练加速（Liger）、快一个数量级的切词（gigatoken）；Windows 先看「N 卡训练」一节
 ```

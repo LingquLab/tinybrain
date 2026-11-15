@@ -6,7 +6,7 @@
 [![Dataset ModelScope](https://img.shields.io/badge/dataset-ModelScope-ffd21f)](https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset)
 [![Video Bilibili](https://img.shields.io/badge/video-Bilibili-fb7299)](https://www.bilibili.com/video/BV1kqsj6EEtT/)
 [![Model in training](https://img.shields.io/badge/model-in%20training-lightgrey)](#status)
-[![GitHub stars](https://img.shields.io/github/stars/cai114514114514/tinybrain?color=15965a)](https://github.com/cai114514114514/tinybrain/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/logitcai/tinybrain?color=15965a)](https://github.com/logitcai/tinybrain/stargazers)
 
 **A Chinese-first small language model, built from scratch — starting from the data.**
 
@@ -41,7 +41,7 @@ Measured on the 5070 Ti: 16 × 2048 per step, ~71k tokens/s, ~12.5 GiB peak memo
 ## Quick start
 
 ```bash
-git clone https://github.com/cai114514114514/tinybrain && cd tinybrain
+git clone https://github.com/logitcai/tinybrain && cd tinybrain
 pip install -e ".[data]"        # Python 3.11+, PyTorch 2.5+; installs the `tinybrain` command
 pip install -e ".[cuda,fast]"   # optional: CUDA kernels (Liger) and fast tokenization
 
