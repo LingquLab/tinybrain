@@ -74,9 +74,15 @@ def generate(model: LanguageModel, idx: torch.Tensor, max_new_tokens: int, tempe
 DEMO_PROMPTS = ["床前明月光，", "北京是中国的", "人工智能是", "def fibonacci(n):", "The capital of France is"]
 
 
+def prompt_ids(tok: Tokenizer, prompt: str) -> list[int]:
+    """续写用的提示：开头放一个文档结束符，意思是「上一篇完了，这里是新一篇的开头」。
+    训练数据里每篇的开头前面都是它；不放的话，模型会把提示当成从某篇文章中间截出来的一段，短提示尤其容易接歪。"""
+    return [tok.eos_id] + tok.encode(prompt)
+
+
 def _continue(model, tok: Tokenizer, prompt: str, max_new: int, temperature: float, top_k: int | None, seed: int) -> str:
     dev = next(model.parameters()).device
-    ids = torch.tensor([tok.encode(prompt)], device=dev)
+    ids = torch.tensor([prompt_ids(tok, prompt)], device=dev)
     gen = torch.Generator(device="cpu").manual_seed(seed) if temperature else None
     out = generate(model, ids, max_new, temperature=temperature, top_k=top_k, eos_id=tok.eos_id, generator=gen if dev.type == "cpu" else None)
     return tok.decode(out[0, ids.size(1):].tolist())

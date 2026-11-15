@@ -109,6 +109,7 @@ tinybrain benchmarks   C-Eval、CMMLU、GSM8K
 tinybrain bench        测这张卡的训练速度和显存
 tinybrain report       参数量报告
 tinybrain overfit      过拟合检查：在一小批数据上把损失训到接近 0
+tinybrain diagnose     诊断：生成重复、和损失对不上时，分清是数据、计算路径还是训练不够
 tinybrain demo         在一个 2300 万参数的小模型上把整条链跑一遍
 tinybrain tensorboard  把训练日志同步成 TensorBoard
 tinybrain judge-check  检查评审模型打分靠不靠谱

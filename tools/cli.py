@@ -23,6 +23,7 @@ COMMANDS = {
     "bench": ("tools.bench", "测这张卡的训练速度和显存"),
     "report": ("tools.report", "参数量报告"),
     "overfit": ("tools.overfit", "过拟合检查：在一小批数据上把损失训到接近 0"),
+    "diagnose": ("tools.diagnose", "诊断：生成重复、和损失对不上时，分清是数据、计算路径还是训练不够"),
     "demo": ("tools.demo", "在一个 2300 万参数的小模型上把整条链跑一遍"),
     "tensorboard": ("tools.tensorboard", "把训练日志同步成 TensorBoard"),
     "judge-check": ("tools.judge_check", "检查评审模型打分靠不靠谱"),
