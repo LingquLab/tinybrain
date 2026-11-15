@@ -10,6 +10,8 @@
   2. 数据        结束符占多少、一篇平均多长（决定了短续写里该不该出现结束符）；真实文字的重复度，当参照。
   3. 路径一致    同一段词分别走：整段前向（训练用的那条）、逐词缓存、静态缓存（CUDA 上生成用的那条）、CPU 单精度。
                  各条路径给出的损失和下一个词应该一样。不一样，说明训练和生成算的不是同一个函数——内核、精度或缓存有错。
+                 还会用训练时验证的那几批片段在这台设备上重算验证集损失，和日志里的数比：在 CPU 上跑诊断时，
+                 这一项就是「CPU 单精度」对「CUDA 半精度加各种内核」的直接对比。
                  顺带报告各归一化层输入的大小：nn.RMSNorm 的 ε 默认取输入精度的机器 ε（BF16 是 0.0078，FP32 是 1.2e-7），
                  输入的均方小到和 0.0078 可比时，半精度训练、单精度评测会得到不同的结果。
   4. 因果性      改掉后半段的词，前半段的输出不能变。变了就是训练时偷看了后面的词：损失很低，生成一塌糊涂。
@@ -96,6 +98,23 @@ def static_forward(model, x: torch.Tensor) -> torch.Tensor:
     return torch.stack(out, dim=1)
 
 
+@torch.no_grad()
+def validation_loss(model, data, batch_size: int, seq_len: int, batches: int, device: torch.device, rows_at_once: int = 4) -> float:
+    """和 train_pretrain.evaluate 取完全相同的片段（同样的种子），在这台设备上重算验证集损失。一次只算几段，CPU 上也放得下。"""
+    total, n = 0.0, 0
+    for i in range(batches):
+        x, y = data.batch(batch_size, seq_len, seed=1_000_003 * (i + 1), device=device)
+        for s in range(0, batch_size, rows_at_once):
+            with autocast(device):
+                out = model(x[s:s + rows_at_once], y[s:s + rows_at_once], return_logits=False)
+            rows = x[s:s + rows_at_once].size(0)
+            total += float(out.loss - out.balance_loss) * rows
+            n += rows
+        print(f"\r  重算验证集损失：{i + 1}/{batches} 批，目前 {total / n:.4f}", end="", flush=True)
+    print()
+    return total / n
+
+
 def norm_inputs(model, x: torch.Tensor) -> list[tuple[str, float]]:
     """每个归一化层输入的均方（取 1% 分位：最小的那批位置），从小到大。"""
     seen, hooks = {}, []
@@ -134,6 +153,7 @@ def diagnose(args) -> dict:
         steps = config.get("steps")
         last = next((r for r in reversed(records) if "smooth_loss" in r), {})
         val = [r for r in records if "val_loss" in r]
+        report["val_log"] = val[-1] if val else None
         print(f"  最近一条：第 {last.get('step')} 步" + (f" / 共 {steps} 步（{last.get('step', 0) / steps:.1%}）" if steps else "") +
               f"，已训 {count(last.get('tokens', 0))} 词，平滑损失 {last.get('smooth_loss')}，学习率×{last.get('lr_scale')}")
         if val:
@@ -194,6 +214,18 @@ def diagnose(args) -> dict:
         report["paths"][name] = dict(loss=loss, agree=agree, max_gap=gap)
         if bad:
             problems.append(f"「{name}」和训练用的路径算出来的不一样（损失 {loss:.3f} 对 {base_loss:.3f}，下一个词一致 {agree:.1%}）")
+    val_batches = train_args.get("eval_batches", 20) if args.val_batches is None else args.val_batches
+    logged = report.get("val_log")
+    if val_batches and logged and open_mixed(data_spec, "val") and "batch_size" in train_args:
+        print(f"  用训练时验证的那几批片段（{val_batches} 批 × {train_args['batch_size']} 段 × {train_args['seq_len']} 词，种子相同）在这台设备上重算：")
+        here = validation_loss(model, open_mixed(data_spec, "val"), train_args["batch_size"], train_args["seq_len"], val_batches, device)
+        gap = here - logged["val_loss"]
+        bad = abs(gap) > LOSS_TOLERANCE
+        print(f"  {'✗' if bad else '✓'} 这台设备 {here:.4f}；训练日志里第 {logged['step']} 步是 {logged['val_loss']}（训练的设备和精度算的）；差 {gap:+.4f}"
+              + ("" if val_batches == train_args.get("eval_batches", 20) else "（批数和训练时不同，只能粗比）"))
+        report["val_here"] = here
+        if bad:
+            problems.append(f"同样的验证片段，这台设备算出来的损失是 {here:.3f}，训练时记的是 {logged['val_loss']}：两边算的不是同一个函数")
     smallest = norm_inputs(model, x)[:3]
     half_eps = torch.finfo(torch.bfloat16).eps
     print("  归一化层输入的均方（最小的 1% 位置），最小的三层：" + "；".join(f"{n} {v:.3f}" for n, v in smallest))
@@ -270,6 +302,7 @@ def parse_args(argv=None):
     p.add_argument("--run", default="out/small", help="运行目录")
     p.add_argument("--data", default=None, help="切好的词数据目录；不写就用存档旁边 config.json 里记的那份")
     p.add_argument("--seq-len", type=int, default=0, help="检查用多长的片段；不写就用训练时的长度")
+    p.add_argument("--val-batches", type=int, default=None, help="重算验证集损失用几批；不写就和训练时一样（这样才能和日志里的数直接比），0 是跳过")
     p.add_argument("--rows", type=int, default=16, help="第 5、6 项用几段")
     p.add_argument("--max-new", type=int, default=100, help="第 7 项每个开头续写多少个词")
     p.add_argument("--no-cpu", action="store_true", help="跳过 CPU 上的那次对比（大模型在 CPU 上很慢）")
