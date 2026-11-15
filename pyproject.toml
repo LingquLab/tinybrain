@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,8 @@ name = "tinybrain"
 version = "0.1.0"
 description = "一个小型中文语言模型（多流残差、Engram 记忆、滑动窗口注意力），以及配套的预训练数据集构建流水线"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["torch>=2.5"]
 

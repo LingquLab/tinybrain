@@ -33,6 +33,7 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 - [推理](#推理)
 - [演示结果](#演示结果)
 - [还没做的](#还没做的)
+- [许可证](#许可证)
 - [参考](#参考)
 
 ---
@@ -311,7 +312,7 @@ tinybrain tokenizer eval tokenizer/tokenizer.model
 | nano | 0.99B | 54 万 | 2.1 GB | 跑通流程、做小实验 |
 | mini | 4.96B | 348 万 | 10.3 GB | small（167M） |
 | base | 20.19B | 1319 万 | 40.6 GB | medium（499M） |
-| full | 60.26B | 4298 万 | 117 GB | large（1.09B） |
+| full | 60.26B | 4298 万 | 117 GB | large（1.18B） |
 
 每个文件都是完整的一档、内部打乱：要 mini 就只读 `pretrain_mini.parquet`。列：`text`、`source`、`category`、`license`、`quality`、`est_tokens`。
 
@@ -653,6 +654,12 @@ CUDA 上生成走静态缓存：键值缓存按最大长度预先分配，每一
 - 古文、诗词的专门评测；MMLU、MATH-500、HumanEval、MBPP、IFEval 这些基准；
 - large 接小米开源的 MiMo agent 环境（通过 `inference/serve.py` 的 OpenAI 兼容接口）；
 - 诗词格律换成平水韵的字表。
+
+---
+
+## 许可证
+
+代码以 [MIT 许可证](LICENSE) 发布。数据集没有统一的许可证，每篇文档按所属来源的许可证，见[许可](#许可)。
 
 ---
 
