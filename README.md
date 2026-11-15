@@ -1,5 +1,13 @@
 # tinybrain
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-2140d6)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-2140d6)](pyproject.toml)
+[![PyTorch 2.5+](https://img.shields.io/badge/PyTorch-2.5%2B-e9482b)](https://pytorch.org)
+[![数据集 ModelScope](https://img.shields.io/badge/%E6%95%B0%E6%8D%AE%E9%9B%86-ModelScope-ffd21f)](https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset)
+[![视频 B 站](https://img.shields.io/badge/%E8%A7%86%E9%A2%91-B%20%E7%AB%99-fb7299)](https://www.bilibili.com/video/BV1kqsj6EEtT/)
+[![模型 训练中](https://img.shields.io/badge/%E6%A8%A1%E5%9E%8B-%E8%AE%AD%E7%BB%83%E4%B8%AD-lightgrey)](#现状)
+[![GitHub stars](https://img.shields.io/github/stars/cai114514114514/tinybrain?color=15965a)](https://github.com/cai114514114514/tinybrain/stargazers)
+
 **从一个字开始，自己做一个中文大模型。**
 
 60B token 开源中文数据 · 自己训的分词器 · 预训练到强化学习的全流程 · 专门为古文和诗词练过
@@ -13,17 +21,22 @@ tinybrain 是一个从零写起的中文小模型项目。和 [MiniMind](https:/
 - **后训练做全套**：SFT → 领域专家 → 多老师在线蒸馏（MOPD）→ 强化学习（RLVR、agent RL、RLAIF），10 种题型、各自的判分器。
 - **以中文为主**：分词器、数据配比、评分细则都按中文定，另外专门放了古文、诗词、鲁迅全集。
 
-> **现状（2026-11-15）**：模型、数据流水线、四档预训练数据、整套后训练（SFT、MOPD、RL）和评测都写完了，有测试；
-> 在一个 2300 万参数的演示模型上，用最终的数据把整条链（预训练 → 退火 → SFT → agent RL → RLAIF → 专家 → RLVR → MOPD → 评测）跑通过。
-> **small 已暂停，保留第 82,500 步存档，转向 medium（499M）**。small 的 2048 × 16 配置曾达到稳态约 7.1 万 token/秒、0.46 秒/步，进程专用显存峰值约 12.54 GiB。训练仍在早期，生成质量尚未成熟。
-> medium 已从头开始训练：2048 长度、微批 4 × 累积 4，真实训练稳态约 2.59 万 token/秒、1.26 秒/完整一步。Windows 30 次采样的专用显存峰值约 12.44 GiB、共享显存约 82 MiB；30 步独立 bench 的 PyTorch reserved 峰值约 13.33 GiB。
+## 现状
+
+2026-11-15：代码、四档预训练数据、整套后训练和评测都写完了，有测试；整条链（预训练 → 退火 → SFT → agent RL → RLAIF → 专家 → RLVR → MOPD → 评测）在一个 2300 万参数的演示模型上跑通过。**训练好的权重还没有发布。**
+
+- **medium**（4.99 亿参数）正在预训练：训到约 10.6 亿词时验证损失 2.75。small 训到同样的词数时是 3.01，medium 低了 0.26。
+- **small**（1.67 亿参数）训到约 33 亿词（第 100,400 步）时验证损失 2.85，已经走到曲线的平缓段，暂停了。
+- 现在的存档只会续写，还不会对话。用 `tinybrain serve` 打开[聊天网页](#聊天网页)，在「续写」里能看到它学到了什么。medium 训完会接着做后训练，到时候发布权重和评测分数。
 
 ---
 
 ## 目录
 
 - [要花多少](#要花多少)
+- [现状](#现状)
 - [快速开始](#快速开始)
+- [聊天网页](#聊天网页)
 - [代码结构](#代码结构)
 - [模型](#模型)
 - [分词器](#分词器)
@@ -86,6 +99,7 @@ tinybrain sft             # SFT：data/sft_small.parquet，从上一步出发 �
 tinybrain generate        # 预训练完：续写几个内置的开头
 tinybrain chat --demo     # SFT 完：把内置的 8 个问题挨个问一遍
 tinybrain chat            # 自己聊（--tools 打开计算器和 Python）
+tinybrain serve           # 聊天网页：浏览器打开 http://127.0.0.1:8001/
 ```
 
 - 换更大的数据：`--data data/pretrain_mini.parquet`；换尺寸：`--preset medium`（写到 `out/medium/`）。
@@ -107,7 +121,7 @@ tinybrain distill      MOPD：多老师在线蒸馏
 tinybrain rl           强化学习（GRPO）：RLVR、agent RL、RLAIF
 tinybrain generate     续写：看预训练模型学到了什么
 tinybrain chat         命令行对话（--demo 把内置的问题问一遍）
-tinybrain serve        OpenAI 兼容的服务
+tinybrain serve        聊天网页和 OpenAI 兼容的服务
 tinybrain eval         评测：留出集损失、各题型正确率、评审打分
 tinybrain benchmarks   C-Eval、CMMLU、GSM8K
 tinybrain bench        测这张卡的训练速度和显存
@@ -118,6 +132,24 @@ tinybrain demo         在一个 2300 万参数的小模型上把整条链跑一
 tinybrain tensorboard  把训练日志同步成 TensorBoard
 tinybrain judge-check  检查评审模型打分靠不靠谱
 ```
+
+---
+
+## 聊天网页
+
+```bash
+tinybrain serve                                           # 用 out/small 里走得最远的存档
+tinybrain serve out/medium/pretrain/ckpt.pt --port 8001   # 指定存档；浏览器打开 http://127.0.0.1:8001/
+```
+
+![聊天网页：2300 万参数演示模型的续写](docs/images/chat-demo.png)
+
+<sub>截图里是 2300 万参数的演示模型，只为展示页面；这个尺寸只会复读。</sub>
+
+- **续写**：写一个开头，模型接着往下写（黑字是你写的，蓝字是模型写的）。预训练、退火的存档还没学过对话，只能这样用，网页会默认打开续写，并在顶上说明。
+- **对话**：多轮对话，前面说过的话会一起发给模型。SFT 之后的存档默认打开对话。
+- 边生成边显示，可以随时停止；左边能调温度、候选词个数和最多写多少词，下面写着这次写了多少词、每秒多少词。
+- 网页不加载任何外部资源，本机离线也能用。服务默认只在本机（127.0.0.1）上开，要让别的机器访问，加 `--host 0.0.0.0`。
 
 ---
 
@@ -634,8 +666,10 @@ C-Eval 是 CC BY-NC-SA 4.0、CMMLU 是 CC BY-NC 4.0，只下载到本地评测�
 
 ```bash
 tinybrain chat --tools                         # 命令行对话：默认用 out/small 里走得最远的存档；--tools 打开计算器和 Python
-tinybrain serve out/small/rl/ckpt.pt --port 8001  # OpenAI 兼容的 /v1/chat/completions，支持工具调用
+tinybrain serve out/small/rl/ckpt.pt --port 8001  # 聊天网页，以及 OpenAI 兼容的接口（见下）
 ```
+
+`tinybrain serve` 的接口：`POST /v1/chat/completions`（对话，支持工具调用）、`POST /v1/completions`（续写，提示前面自动加文档结束符）、`GET /v1/models`、`GET /v1/info`（存档、阶段、步数、参数量）。请求里写 `"stream": true` 就按 OpenAI 的格式边生成边推送；读的一方断开，服务端就不再往下生成。
 
 续写和生成式评测默认温度 0.8、只在概率最高的 50 个词里采样；`tinybrain generate`、`tinybrain eval`、`tinybrain benchmarks run` 都可以用 `--temperature`、`--top-k`、`--seed` 改，默认种子 0，评测结果里记下采样参数。`--temperature 0` 是每步取概率最大的词。预训练续写在提示前加文档结束符，生成出结束符就停。
 

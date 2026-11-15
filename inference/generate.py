@@ -85,6 +85,30 @@ def generate(model: LanguageModel, idx: torch.Tensor, max_new_tokens: int, tempe
     return idx
 
 
+@torch.no_grad()
+def stream(model: LanguageModel, idx: torch.Tensor, max_new_tokens: int, temperature: float = DEFAULT_TEMPERATURE, top_k: int | None = DEFAULT_TOP_K,
+           top_p: float | None = None, eos_id: int | Iterable[int] | None = None, generator: torch.Generator | None = None):
+    """和 generate 的普通路径一样逐词生成（只收一行提示），但每出一个词就交出来，网页上边写边显示。
+    写出停止符（也会交出来）或到了长度上限就停；用的一方不再要了（关掉这个生成器），就不再往下算。"""
+    if idx.size(0) != 1:
+        raise ValueError("stream 一次只生成一行")
+    was_training = model.training
+    model.eval()
+    try:
+        state = model.new_state()
+        stops = set() if eos_id is None else ({eos_id} if isinstance(eos_id, int) else set(eos_id))
+        step = idx
+        for _ in range(min(max_new_tokens, model.cfg.max_seq_len - idx.size(1))):
+            logits = model(step, state=state).logits[:, -1]
+            step = sample_next(logits, temperature, top_k, top_p, generator)
+            token = int(step)
+            yield token
+            if token in stops:
+                return
+    finally:
+        model.train(was_training)
+
+
 # 不给 --prompt 时续写的开头：诗词、常识、代码、英文
 DEMO_PROMPTS = ["床前明月光，", "北京是中国的", "人工智能是", "def fibonacci(n):", "The capital of France is"]
 

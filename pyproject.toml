@@ -24,3 +24,6 @@ tinybrain = "tools.cli:main"   # pip install -e . 之后：tinybrain pretrain、
 
 [tool.setuptools.packages.find]
 include = ["lm*", "training*", "inference*", "eval*", "tools*", "dataset*"]
+
+[tool.setuptools.package-data]
+inference = ["web/*.html"]  # tinybrain serve 的聊天网页

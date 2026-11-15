@@ -1,5 +1,13 @@
 # tinybrain
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-2140d6)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-2140d6)](pyproject.toml)
+[![PyTorch 2.5+](https://img.shields.io/badge/PyTorch-2.5%2B-e9482b)](https://pytorch.org)
+[![Dataset ModelScope](https://img.shields.io/badge/dataset-ModelScope-ffd21f)](https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset)
+[![Video Bilibili](https://img.shields.io/badge/video-Bilibili-fb7299)](https://www.bilibili.com/video/BV1kqsj6EEtT/)
+[![Model in training](https://img.shields.io/badge/model-in%20training-lightgrey)](#status)
+[![GitHub stars](https://img.shields.io/github/stars/cai114514114514/tinybrain?color=15965a)](https://github.com/cai114514114514/tinybrain/stargazers)
+
 **A Chinese-first small language model, built from scratch — starting from the data.**
 
 [中文](README.md) · [Dataset on ModelScope](https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset) · [Video (Bilibili)](https://www.bilibili.com/video/BV1kqsj6EEtT/)
@@ -11,7 +19,13 @@ tinybrain is a from-scratch language model project in the spirit of [nanochat](h
 - **The whole post-training stack.** SFT → domain experts → multi-teacher on-policy distillation (MOPD) → RL (RLVR, agent RL, RLAIF), with 10 task types and their own graders.
 - **Chinese first.** The tokenizer, data mixture and grading rubrics are designed around Chinese, with classical Chinese, poetry and Lu Xun's complete works included on purpose.
 
-> **Status (2026-11-15).** The model, data pipeline, four pretraining tiers, the full post-training stack and evaluation are written and tested. The whole chain (pretrain → anneal → SFT → agent RL → RLAIF → experts → RLVR → MOPD → eval) has been run on a 23M-param demo model. small (167M) was paused at step 82,500 (~2.7B tokens); medium (499M) is now pretraining on an RTX 5070 Ti. **No useful weights have been released yet.**
+## Status
+
+2026-11-15. The model, data pipeline, four pretraining tiers, the full post-training stack and evaluation are written and tested, and the whole chain has been run end to end on a 23M-param demo model. **No trained weights have been released yet.**
+
+- **medium** (499M) is pretraining: validation loss 2.75 at about 1.06B tokens, where small was at 3.01.
+- **small** (167M) reached 2.85 at about 3.3B tokens (step 100,400) and is paused on the flat part of its curve.
+- Current checkpoints only continue text; they can't chat yet. `tinybrain serve` opens a chat page whose "continue" mode shows what they have learned. Post-training, weights and benchmark scores come after medium finishes.
 
 ## What it costs
 
@@ -38,6 +52,7 @@ tinybrain pretrain     # data/pretrain_nano.parquet → out/small/pretrain
 tinybrain sft          # continues from the previous stage → out/small/sft
 tinybrain generate     # continue a few built-in prompts
 tinybrain chat         # chat (--tools enables a calculator and Python)
+tinybrain serve        # chat page at http://127.0.0.1:8001/ (continue mode for base checkpoints), plus an OpenAI-compatible API
 ```
 
 Each stage writes to `out/<preset>/<stage>/` and starts from the previous stage's checkpoint, so no paths are needed. Use `--preset medium` for a bigger model and `--data data/pretrain_mini.parquet` for more data. `tinybrain demo` runs every stage on the 23M demo model. `tinybrain <command> --help` lists all options.

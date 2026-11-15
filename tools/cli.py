@@ -17,7 +17,7 @@ COMMANDS = {
     "rl": ("training.train_rl", "强化学习（GRPO）：RLVR、agent RL、RLAIF"),
     "generate": ("inference.generate", "续写：看预训练模型学到了什么"),
     "chat": ("inference.chat", "命令行对话（--demo 把内置的问题问一遍）"),
-    "serve": ("inference.serve", "OpenAI 兼容的服务"),
+    "serve": ("inference.serve", "聊天网页和 OpenAI 兼容的服务"),
     "eval": ("eval.suite", "评测：留出集损失、各题型正确率、评审打分"),
     "benchmarks": ("eval.benchmarks", "C-Eval、CMMLU、GSM8K"),
     "bench": ("tools.bench", "测这张卡的训练速度和显存"),
