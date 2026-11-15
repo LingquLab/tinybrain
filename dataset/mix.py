@@ -383,13 +383,41 @@ SOURCE_LICENSE_NOTE = """这是一个混合数据集，没有统一的许可证�
 - arxiv 的论文各自有许可证（per-paper），以论文本身为准。"""
 
 
+# 数据集说明的头部。ModelScope 只认「领域: 任务: language/type」这种嵌套写法（网页上的领域、任务、语言标签从这里来）；
+# license、language、task_categories、size_categories、tags 是 Hugging Face 的写法，以后传 HF 用，ModelScope 也认 license。
+CARD_HEADER = """---
+license: other
+language:
+- zh
+- en
+task_categories:
+- text-generation
+size_categories:
+- 10M<n<100M
+tags:
+- pretraining
+- sft
+- reinforcement-learning
+- chinese
+text:
+  text-generation:
+    language:
+    - zh
+    - en
+    type:
+    - pretraining
+    - sft
+    - rl
+---"""
+
+
 def dataset_card(report: dict) -> str:
     """数据集说明（Markdown，带 ModelScope / Hugging Face 认的头部信息）。report 是 verify_tiers 的结果：
     sources 是每个来源的篇数，source_tokens 是每个来源的估算 token 数。"""
     tiers = [t for t in TIERS if t in report]
     cat_of = {s: c for c, (_, sources) in MIX.items() for s in sources}
     unclear = [s for s in cat_of if "待确认" in PRETRAIN.get(s, {}).get("license", "") and any(report[t]["source_tokens"].get(s) for t in tiers)]
-    lines = ["---", "license: other", "language:", "- zh", "- en", "task_categories:", "- text-generation", "tags:", "- pretraining", "---", "",
+    lines = CARD_HEADER.splitlines() + ["",
              "# tinybrain dataset", "",
              "tinybrain 的中文为主的混合预训练数据集。清洗、去重、分档的代码和模型在 https://github.com/cai114514114514/tinybrain 。", "",
              "从 26 个公开来源清洗、跨来源去重后，按配比和质量挑选出的四档预训练数据。四档是套娃关系 nano ⊂ mini ⊂ base ⊂ full："
