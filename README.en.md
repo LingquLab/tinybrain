@@ -123,6 +123,10 @@ How it's made: per-document cleaning (mojibake, punctuation, traditional→simpl
 
 Details: [docs/post-training.md](docs/post-training.md) (Chinese).
 
+## Contact and sponsorship
+
+The compute for training is paid for out of my own pocket. If you would like to sponsor compute or work together, write to [3995756625@qq.com](mailto:3995756625@qq.com); sponsors will be credited in the README and in future videos. For questions and feedback, please open an [issue](https://github.com/logitcai/tinybrain/issues).
+
 ## License and data
 
 Code: [MIT](LICENSE). Each document in the dataset carries its source's license. C-Eval and CMMLU are non-commercial and are only downloaded locally for evaluation; they are not redistributed.
