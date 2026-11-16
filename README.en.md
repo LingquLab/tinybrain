@@ -21,10 +21,10 @@ tinybrain is a from-scratch language model project in the spirit of [nanochat](h
 
 ## Status
 
-2026-11-15. The model, data pipeline, four pretraining tiers, the full post-training stack and evaluation are written and tested, and the whole chain has been run end to end on a 23M-param demo model. **No trained weights have been released yet.**
+2026-11-16. The model, data pipeline, four pretraining tiers, the full post-training stack and evaluation are written and tested, and the whole chain has been run end to end on a 23M-param demo model. **No trained weights have been released yet.**
 
-- **medium** (499M) is pretraining: validation loss 2.75 at about 1.06B tokens, where small was at 3.01.
-- **small** (167M) reached 2.85 at about 3.3B tokens (step 100,400) and is paused on the flat part of its curve.
+- **medium** (499M) is pretraining on the base tier: validation loss 2.50 at about 6.1B tokens. small needed 7.4B tokens to reach 2.76.
+- **small** (167M) is also continuing on the base tier: 2.76 at about 7.4B tokens (step 226,400), on its fitted curve, which points to about 2.67 at the end of the tier (20.2B tokens).
 - Current checkpoints only continue text; they can't chat yet. `tinybrain serve` opens a chat page whose "continue" mode shows what they have learned. Post-training, weights and benchmark scores come after medium finishes.
 
 ## What it costs
@@ -56,6 +56,32 @@ tinybrain serve        # chat page at http://127.0.0.1:8001/ (continue mode for 
 ```
 
 Each stage writes to `out/<preset>/<stage>/` and starts from the previous stage's checkpoint, so no paths are needed. Use `--preset medium` for a bigger model and `--data data/pretrain_mini.parquet` for more data. `tinybrain demo` runs every stage on the 23M demo model. `tinybrain <command> --help` lists all options.
+
+### Full small pipeline
+
+Pretraining → annealing → SFT → RL → evaluation, written for one RTX 5070 Ti 16 GB. You need two terminals: one runs the stages below in order, the other serves the judge model for RL and evaluation (a third for `tinybrain tensorboard` is optional).
+
+```bash
+# terminal 1
+modelscope download --dataset caiwangzsnm/tinybrain-dataset pretrain_mini.parquet \
+    posttrain/sft_small.parquet posttrain/rl_small.parquet posttrain/eval_tasks.parquet --local_dir data
+mv data/posttrain/* data/
+tinybrain benchmarks prepare                                         # C-Eval, CMMLU, GSM8K for local evaluation
+tinybrain pretrain --data data/pretrain_mini.parquet                 # ~20 h on a 5070 Ti → out/small/pretrain
+tinybrain prepare --chat --train-on all --input data/sft_small.parquet --out data/tokens/chat-all
+tinybrain pretrain --init out/small/pretrain/ckpt.pt --data data/pretrain_mini.parquet:0.9,data/tokens/chat-all:0.1 \
+    --epochs 0.1 --warmup-steps 0 --lr-mult 0.1 --final-lr-frac 0     # annealing, ~2 h → out/small/anneal
+tinybrain sft                                                        # → out/small/sft
+tinybrain rl --judge-url http://<judge-host>:8080/v1 --judge-workers 1 --judge-timeout 600   # → out/small/rl
+tinybrain eval out/small/rl/ckpt.pt --tasks data/eval_tasks.parquet --bench ceval cmmlu gsm8k \
+    --judge-url http://<judge-host>:8080/v1 --judge-workers 1
+
+# terminal 2: the judge (Qwen3.8-27B) does not fit in 16 GB; on an Apple-silicon Mac with 32 GB+:
+pip install mlx-lm
+python -m mlx_lm.server --model mlx-community/Qwen3.8-27B-4bit --host 0.0.0.0 --port 8080
+```
+
+mlx_lm.server answers one request at a time, hence `--judge-workers 1`; with vLLM on a 40 GB+ GPU you can drop it. SFT, RL and evaluation times have not been measured on a GPU yet. If you already have a pretrained checkpoint, start from the annealing step with your own `--init` and data; `--steps 10000` (about 330M tokens) keeps it short.
 
 ## Model
 
