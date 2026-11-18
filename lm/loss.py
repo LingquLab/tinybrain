@@ -57,15 +57,20 @@ def margin_saturation(logits: torch.Tensor, targets: torch.Tensor, ignore_index:
         return float((m > cliff).float().mean())
 
 
+@torch.compiler.disable
+def _liger_cross_entropy(hidden, weight, targets, chunk_mem_const):
+    return LigerFusedLinearCrossEntropyFunction.apply(
+        hidden, weight, targets, None, None, -1, 0.0, 0.0, "mean", None, False,
+        None, False, False, False, None, None, chunk_mem_const
+    )[0]
+
+
 def linear_cross_entropy(hidden, weight, targets, chunk: int = 4096, chunk_mem_const: int = 8):
     """hidden: (..., d)，weight: (词表, d)，targets 里等于 -1 的位置不算。返回平均损失。"""
     hidden = hidden.reshape(-1, hidden.size(-1))
     targets = targets.reshape(-1)
     if hidden.is_cuda and LigerFusedLinearCrossEntropyFunction is not None:
-        return LigerFusedLinearCrossEntropyFunction.apply(
-            hidden, weight, targets, None, None, -1, 0.0, 0.0, "mean", None, False,
-            None, False, False, False, None, None, chunk_mem_const
-        )[0]
+        return _liger_cross_entropy(hidden, weight, targets, chunk_mem_const)
     total = hidden.new_zeros((), dtype=torch.float32)
     for start in range(0, targets.numel(), chunk):
         logits = F.linear(hidden[start:start + chunk], weight)

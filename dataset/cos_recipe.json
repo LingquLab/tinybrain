@@ -1,0 +1,199 @@
+{
+  "version": 2,
+  "status": "packed_and_audited",
+  "candidate_source": "data/cos-v2/curated",
+  "out": "data/cos-v2/final-candidates-reviewed",
+  "packed_out": "data/tokens/anneal-small-v2",
+  "tokenizer": "data/tokens/base/tokenizer.model",
+  "base_parquet": "data/pretrain_base.parquet",
+  "sft_parquet": "data/posttrain/sft_small.parquet",
+  "planned_tokens": 655360000,
+  "cooldown_steps": 20000,
+  "seq_len": 2048,
+  "effective_batch_size": 16,
+  "memory_limit_gib": 3,
+  "minimum_available_gib": 8.5,
+  "threads": 2,
+  "pool_multiple": 2,
+  "validation_modulus": 100,
+  "stage_start_after_pretrain_step": 554354,
+  "automatic_training_start": false,
+  "notes": [
+    "All percentages refer to training tokens, not document counts.",
+    "Targets are separate from measured availability; shortfalls must be reported, not hidden by repeated samples.",
+    "Only one export format per source is read. Fineweb V3 sample archives are audit-only because of length/language/level mismatch.",
+    "Educational-web filtering is not factual verification. Synthetic dialogue retains generator/source provenance.",
+    "Original base validation documents and original SFT validation prompts stay out of training.",
+    "Validation pools are unique and are never repeated to meet training proportions.",
+    "Literal extraction/copy/cloze/JSON tasks are derived from supplied educational text, retain the parent split, and do not add independently verified facts.",
+    "Human-verified source labels do not establish whether an answer was human-written.",
+    "Curated training texts may also occur in ordinary base training replay; this is intentional reweighting, not extra unique knowledge."
+  ],
+  "filters": {
+    "foundation_only": true,
+    "clinical": "治疗|疗效|处方|抗癌|抗病毒|药物|用药|诊断|副作用|清冠|中药|偏方|甲亢|药剂|药品|治愈",
+    "ephemeral": "申领|稳岗|补贴|报销|贷款利率|实时行情|今日股价|最新政策|政府工作报告|十四五规划|十九大报告|党的建设|党风廉政|学习贯彻|重要讲话精神",
+    "catalog": "ISBN|书号|图书简介|出版日期|出版时间|编辑推荐|作者简介|产品尺寸及重量|条形码|图书目录",
+    "advanced": "研究生|博士|硕士论文|学位论文|泛函分析|微分流形|黎曼几何|量子场论|代数拓扑|奥林匹克竞赛|奥数竞赛|graduate-level|doctoral|algebraic topology",
+    "boilerplate": "关注公众号|立即购买|会员专享|付费下载|扫码购买|点击购买|点击下载|购物车|收藏宝贝",
+    "other_model": "(?:我是|我叫|作为|身为)[^。\\n]{0,12}(?:ChatGPT|GPT-?\\d|Claude|通义千问|Qwen|DeepSeek|Gemini|Llama)",
+    "unverifiable_lists": "推荐.{0,12}(?:音乐|歌曲|电影|歌单|书籍)|好听.{0,5}歌",
+    "short_request": "简短|一句话|只需回答|只回答|仅输出|直接给出答案|不需要解释|不用解释",
+    "teaching": "定义|基本概念|基本原理|是指|指的是|例如|举例|例题|练习|计算|解法|解析|性质|定律|公式|组成|分为|称为|通常|分类|规律|方法|区别|意义",
+    "max_dialogue_tokens": 2049,
+    "max_answer_chars_when_short_requested": 120,
+    "min_text_chars": 200,
+    "max_text_chars": 18000,
+    "min_chinese_fraction": 0.35
+  },
+  "buckets": [
+    {
+      "name": "dialogue_basic",
+      "label": "通用单轮问答",
+      "kind": "chat",
+      "weight": 0.06
+    },
+    {
+      "name": "dialogue_instruction",
+      "label": "指令与格式遵循",
+      "kind": "chat",
+      "weight": 0.05
+    },
+    {
+      "name": "dialogue_reading",
+      "label": "有材料的阅读理解",
+      "kind": "chat",
+      "weight": 0.06
+    },
+    {
+      "name": "dialogue_multiturn",
+      "label": "多轮追问与澄清",
+      "kind": "chat",
+      "weight": 0.045
+    },
+    {
+      "name": "dialogue_reasoning",
+      "label": "基础数学与逻辑应用题",
+      "kind": "chat",
+      "weight": 0.055
+    },
+    {
+      "name": "dialogue_writing",
+      "label": "摘要改写与语言表达",
+      "kind": "chat",
+      "weight": 0.03
+    },
+    {
+      "name": "knowledge_math",
+      "label": "算术、代数与几何基础",
+      "kind": "text",
+      "weight": 0.07,
+      "keywords": "加法|减法|乘法|除法|整数|小数|分数|百分数|百分比|算术|四则运算|方程|未知数|函数|几何|三角形|平行线|垂直|周长|面积|体积|概率|统计|比例|比值|数轴|代数|圆周率|正方形|长方形",
+      "sources": [
+        "fw22_4_5",
+        "fw22_3_4",
+        "wiki_zh",
+        "baidu_baike"
+      ]
+    },
+    {
+      "name": "knowledge_physics",
+      "label": "力、运动、热、光与电",
+      "kind": "text",
+      "weight": 0.0475,
+      "keywords": "物理学|物理量|运动|速度|加速度|牛顿|惯性|重力|摩擦力|浮力|压强|功率|动能|势能|机械能|热量|比热容|温度|电荷|电流|电压|电阻|电路|欧姆定律|磁场|电场|电磁|折射|反射|透镜|声波|光速",
+      "sources": [
+        "fw22_4_5",
+        "fw22_3_4",
+        "wiki_zh",
+        "baidu_baike"
+      ]
+    },
+    {
+      "name": "knowledge_chemistry",
+      "label": "原子分子、元素与化学反应",
+      "kind": "text",
+      "weight": 0.05,
+      "keywords": "化学|原子|分子|元素|电子|质子|中子|化合物|单质|化学式|化学反应|化学键|离子|氧化|还原|酸碱|酸性|碱性|溶液|溶解度|催化|氢气|氧气|二氧化碳|质量守恒|化合价|电中性",
+      "sources": [
+        "fw22_4_5",
+        "fw22_3_4",
+        "wiki_zh",
+        "baidu_baike"
+      ]
+    },
+    {
+      "name": "knowledge_biology",
+      "label": "细胞、遗传与生命科学基础",
+      "kind": "text",
+      "weight": 0.0375,
+      "keywords": "生物学|细胞|细胞膜|细胞核|细胞质|基因|遗传|染色体|蛋白质|光合作用|呼吸作用|新陈代谢|食物链|生态系统|叶绿体|线粒体|植物|动物|微生物|进化|生殖|光合|种子|胚芽",
+      "sources": [
+        "fw22_4_5",
+        "fw22_3_4",
+        "wiki_zh",
+        "baidu_baike"
+      ]
+    },
+    {
+      "name": "knowledge_geography",
+      "label": "地球、天气、气候与地理",
+      "kind": "text",
+      "weight": 0.05,
+      "keywords": "地理|地球|经度|纬度|经线|纬线|地壳|板块|岩石|火山|地震|气候|天气|大气|季风|洋流|海洋|水循环|降水|蒸发|地形|平原|山地|盆地|地球自转|地球公转|地球运动|地理位置",
+      "sources": [
+        "fw22_4_5",
+        "fw22_3_4",
+        "wiki_zh",
+        "baidu_baike"
+      ]
+    },
+    {
+      "name": "knowledge_language",
+      "label": "语法、阅读、修辞与文学基础",
+      "kind": "text",
+      "weight": 0.065,
+      "keywords": "语法|词性|名词|动词|形容词|副词|主语|谓语|宾语|定语|状语|补语|修辞|比喻|拟人|排比|对偶|汉字|拼音|标点|阅读理解|段落|中心思想|文章结构|诗歌|散文|文言文|文学|成语",
+      "sources": [
+        "fw22_4_5",
+        "fw22_3_4",
+        "wiki_zh",
+        "baidu_baike",
+        "poetry"
+      ]
+    },
+    {
+      "name": "knowledge_history",
+      "label": "历史脉络与社会基础常识",
+      "kind": "text",
+      "weight": 0.045,
+      "keywords": "历史|朝代|年代|年表|先秦|秦朝|汉朝|唐朝|宋朝|元朝|明朝|清朝|史料|文明|工业革命|农业革命|丝绸之路|考古|封建制度|奴隶制度|生产力|生产关系|货币|商品|经济学|供给|需求|交换|社会学",
+      "sources": [
+        "fw22_4_5",
+        "fw22_3_4",
+        "wiki_zh",
+        "baidu_baike"
+      ]
+    },
+    {
+      "name": "knowledge_computing",
+      "label": "计算机、算法与信息基础",
+      "kind": "text",
+      "weight": 0.035,
+      "keywords": "计算机|二进制|十进制|字节|比特|编码|算法|数据结构|操作系统|存储器|处理器|内存|硬盘|输入设备|输出设备|网络协议|互联网|局域网|IP地址|数据库|程序设计|编程语言|变量|循环|条件语句|数组|链表|排序|搜索",
+      "sources": [
+        "fw22_4_5",
+        "fw22_3_4",
+        "wiki_zh",
+        "baidu_baike"
+      ]
+    },
+    {
+      "name": "ordinary_replay",
+      "label": "保持原 base 分布的预训练回放",
+      "kind": "reference",
+      "weight": 0.3,
+      "directory": "data/tokens/base"
+    }
+  ]
+}

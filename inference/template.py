@@ -69,7 +69,7 @@ class ChatFormat:
         ids = self.encode(messages, train_on="all")[0] if messages else []
         return ids + self._heads["assistant"]
 
-    def parse_turn(self, ids: list[int]) -> tuple[str, list[dict], list[str]]:
+    def parse_turn(self, ids: list[int], allow_plain_calls: bool = False) -> tuple[str, list[dict], list[str]]:
         """把模型生成的一轮 assistant（到 <|im_end|> 为止）拆成 (正文, 工具调用, 解析不了的调用的原文)。"""
         ids = list(ids)
         if self.end in ids:
@@ -83,6 +83,7 @@ class ChatFormat:
                     call = json.loads(raw)
                     if not isinstance(call, dict) or not isinstance(call.get("name"), str):
                         raise ValueError
+                    if not isinstance(call.get('arguments') or {},dict):raise ValueError
                     calls.append({"name": call["name"], "arguments": call.get("arguments") or {}})
                 except ValueError:
                     broken.append(raw)
@@ -90,7 +91,19 @@ class ChatFormat:
             else:
                 text.append(ids[i])
                 i += 1
-        return self.tok.decode(text), calls, broken
+        body=self.tok.decode(text)
+        if allow_plain_calls and not calls and not broken:
+            raw=body.strip()
+            if raw.startswith('```json') and raw.endswith('```'):raw=raw[7:-3].strip()
+            try:
+                value=json.loads(raw)
+                items=value if isinstance(value,list) else [value]
+                if items and all(isinstance(v,dict) and isinstance(v.get('name'),str) and 'arguments' in v for v in items):
+                    if any(not isinstance(v['arguments'],dict) for v in items):broken.append(raw)
+                    else:calls=[dict(name=v['name'],arguments=v['arguments']) for v in items]
+                    body=''
+            except ValueError:pass
+        return body, calls, broken
 
     def tool_turn(self, content: str) -> list[int]:
         """工具返回结果的那一轮，接着是下一轮 assistant 的开头。"""

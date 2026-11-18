@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["torch>=2.5"]
+dependencies = ["torch>=2.5", "sentencepiece>=0.2", "numpy>=1.26"]
 
 [project.optional-dependencies]
 data = ["numpy", "pyarrow", "OpenCC", "zstandard"]
@@ -18,6 +18,8 @@ fast = ["gigatoken"]  # 切词快一个数量级（tools.prepare 自动使用）
 cuda = ["liger-kernel>=0.8.5,<0.9"]
 cudnn = ["torch>=2.13", "liger-kernel>=0.8.5,<0.9", "nvidia-cudnn-frontend>=1.32.3,<1.33"]
 monitor = ["tensorboard>=2.18"]
+artifact = ["safetensors>=0.4"]
+serve = ["fastapi>=0.115", "uvicorn>=0.30", "safetensors>=0.4"]
 
 [project.scripts]
 tinybrain = "tools.cli:main"   # pip install -e . 之后：tinybrain pretrain、tinybrain chat……

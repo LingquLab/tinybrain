@@ -23,8 +23,9 @@ from pathlib import Path
 import torch
 
 from .dataset import PackedData, open_data
-from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, compile_model, count, find_stage, format_eta, load_model, lr_scale,
-                            optimizers_from_args, pick_device, resume, saturated_share, save_checkpoint, set_lr_scale, setup_device, step_optimizers)
+from .trainer_utils import (add_optimizer_args, autocast, clip_gradients, compile_model, count, find_stage, format_eta, load_checkpoint,
+                            load_model, lr_scale, optimizers_from_args, pick_device, resume, restore_rng, rng_state,
+                            saturated_share, save_checkpoint, set_lr_scale, setup_device, step_optimizers)
 
 
 def open_chat_data(directory: str) -> tuple[PackedData, PackedData]:
@@ -49,16 +50,26 @@ def evaluate(model, data: PackedData, args, device: torch.device) -> tuple[float
     第二个返回值是第一行里 softmax 塌缩的词占比（见 trainer_utils.saturated_share）。"""
     was_training = model.training
     model.eval()
-    total = 0.0
+    total, targets, saturated = 0.0, 0, 0.0
     for i in range(args.eval_batches):
-        x, y = data.batch(args.batch_size, data.row_len - 1, seed=1_000_003 * (i + 1), device=device)
-        with autocast(device):
-            out = model(x, y, return_logits=False)
-        total += (out.loss - out.balance_loss).item()
-        if i == 0:
-            saturated = saturated_share(model, x, y, device)
+        x, y = data.batch(args.eval_batch_size or args.batch_size, data.row_len - 1,
+                          seed=1_000_003 * (i + 1), device=device)
+        micro = args.eval_micro_batch_size or args.batch_size
+        for start in range(0, len(x), micro):
+            xm, ym = x[start:start + micro], y[start:start + micro]
+            n = int((ym != -1).sum())
+            if not n:
+                continue
+            with autocast(device):
+                result = model(xm, ym, return_logits=False)
+            total += (result.loss - result.balance_loss).item() * n
+            targets += n
+            if i == 0 and start == 0:
+                saturated = saturated_share(model, xm, ym, device)
     model.train(was_training)
-    return total / args.eval_batches, saturated
+    if not targets or not math.isfinite(total):
+        raise RuntimeError('SFT validation has no finite supervised targets')
+    return total / targets, saturated
 
 
 def train(args) -> dict:
@@ -66,9 +77,17 @@ def train(args) -> dict:
     resolve_init(args)
     device = pick_device(args.device)
     setup_device(device)
+    if args.gpu_memory_fraction:
+        if device.type != 'cuda' or not 0 < args.gpu_memory_fraction <= 1:
+            raise ValueError('--gpu-memory-fraction requires CUDA and a fraction in (0, 1]')
+        torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, device.index)
     torch.manual_seed(args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    if not args.resume and any((out / name).exists() for name in ('ckpt.pt', 'best.pt', 'log.jsonl')):
+        raise ValueError('SFT output contains a run; use --resume or a new --out')
+    if args.resume and not (out / 'ckpt.pt').exists():
+        raise FileNotFoundError('--resume requires an existing SFT checkpoint')
 
     # 数据
     from tools.prepare import ensure_tokens
@@ -80,7 +99,7 @@ def train(args) -> dict:
 
     # 模型和优化器
     model = load_model(Path(args.init), device)
-    model.gradient_checkpointing = device.type == "cuda"
+    model.gradient_checkpointing = device.type == "cuda" and not args.no_checkpoint
     model.checkpoint_policy = "selective"
     if model.cfg.vocab_size != train_data.vocab_size:
         raise ValueError(f"模型的词表是 {model.cfg.vocab_size}，数据是用 {train_data.vocab_size} 的词表切的")
@@ -88,32 +107,61 @@ def train(args) -> dict:
         raise ValueError(f"数据是按片段长度 {seq_len} 打包的，超过了模型的上限 {model.cfg.max_seq_len}")
     optimizers = optimizers_from_args(model, args)
     start_step = resume(out / "ckpt.pt", model, optimizers, device) if args.resume else 0
+    learned, best_val, best_step = 0, float('inf'), 0
+    if args.resume:
+        state = load_checkpoint(out / 'ckpt.pt', torch.device('cpu'), mmap=True)
+        previous = state.get('sft_config', {})
+        for key in ('data', 'batch_size', 'grad_accum', 'seed'):
+            if previous.get(key) != getattr(args, key):
+                raise ValueError(f'SFT resume changes data order: {key}')
+        progress = state.get('sft_progress', {})
+        learned, best_val, best_step = progress.get('answer_tokens', 0), progress.get('best_val', float('inf')), progress.get('best_step', 0)
+        restore_rng(state.get('rng'))
+        del state
     (out / "config.json").write_text(json.dumps({"sft": vars(args), "steps": steps, "model": json.loads(model.cfg.to_json()), "data": train_data.meta},
                                                 ensure_ascii=False, indent=1), encoding="utf-8")
-    forward = compile_model(model, device, enabled=not args.no_compile, seq_len=seq_len)
+    forward = compile_model(model, device, enabled=not args.no_compile, seq_len=seq_len,
+                            attention_backend=args.attention_backend, autotune=args.autotune)
+    graph_step = None
+    if args.cuda_graph:
+        if device.type != 'cuda' or model.cfg.moe_experts:
+            raise ValueError('--cuda-graph requires CUDA and a dense model')
+        from .cuda_graph import OptimizerGraph
+        graph_step = OptimizerGraph(optimizers)
     print(f"设备 {device}；从 {args.init} 出发；{train_data.rows} 行对话（每行 {seq_len} 词）；"
           f"每步 {args.batch_size * args.grad_accum} 行，共 {steps} 步（约 {steps * args.batch_size * args.grad_accum / train_data.rows:.2f} 轮）", flush=True)
 
     # 训练循环
     model.train()
-    smooth, val_loss, loss_value, learned = None, None, float("nan"), 0
+    smooth, val_loss, loss_value = None, None, float("nan")
     last_time, last_step = time.perf_counter(), start_step
     with open(out / "log.jsonl", "a", encoding="utf-8") as log:
+        if args.eval_before and not args.resume and val_data:
+            val_loss, saturated = evaluate(model, val_data, args, device)
+            best_val = val_loss
+            save_checkpoint(out / 'best.pt', model, [], 0, sft_config=vars(args), validation_loss=val_loss)
+            log.write(json.dumps(dict(step=0, val_loss=val_loss, saturated=saturated)) + '\n'); log.flush()
+            print(f'BASELINE validation_loss={val_loss:.6f}', flush=True)
+            last_time = time.perf_counter()
         for step in range(start_step, steps):
             scale = lr_scale(step, steps, args.warmup_steps, args.final_lr_frac)
             set_lr_scale(optimizers, scale * args.lr_mult)
-            loss_value = 0.0
+            loss_total = None
             for micro in range(args.grad_accum):
                 x, y = train_data.ordered_batch(args.batch_size, seq_len, index=step * args.grad_accum + micro, seed=args.seed, device=device)
                 learned += int((y != -1).sum())
                 with autocast(device):
                     loss = forward(x, y, return_logits=False).loss / args.grad_accum
                 loss.backward()
-                loss_value += loss.item()
+                loss_total = loss.detach() if loss_total is None else loss_total + loss.detach()
+            loss_value = loss_total.item()
             if not math.isfinite(loss_value):
                 raise RuntimeError(f"第 {step} 步的损失变成了 {loss_value}，训练停下。上一个存档在 {out / 'ckpt.pt'}")
             grad_norm = clip_gradients(model.parameters(), args.clip_grad)
-            step_optimizers(optimizers)
+            if graph_step is None:
+                step_optimizers(optimizers)
+            else:
+                graph_step()
             smooth = loss_value if smooth is None else 0.9 * smooth + 0.1 * loss_value
 
             # 记录、验证、存档
@@ -123,7 +171,7 @@ def train(args) -> dict:
                 now = time.perf_counter()
                 epoch = done * args.batch_size * args.grad_accum / train_data.rows
                 record = dict(step=done, epoch=round(epoch, 4), answer_tokens=learned, loss=round(loss_value, 4), smooth_loss=round(smooth, 4),
-                              lr_scale=round(scale, 4), seconds=round(now - last_time, 2))
+                              lr_scale=round(scale, 4),lr_mult=args.lr_mult, seconds=round(now - last_time, 2))
                 if grad_norm is not None:
                     record["grad_norm"] = round(float(grad_norm), 4)
                 eta = format_eta((steps - done) * (now - last_time) / max(1, done - last_step))
@@ -134,13 +182,19 @@ def train(args) -> dict:
                 val_loss, saturated = evaluate(forward, val_data, args, device)
                 record = {**(record or dict(step=done)), "val_loss": round(val_loss, 4), "saturated": round(saturated, 6)}
                 print(f"第 {done:>6} 步  验证集损失 {val_loss:.4f}  塌缩 {saturated:.2%}", flush=True)
+                if val_loss < best_val:
+                    best_val, best_step = val_loss, done
+                    save_checkpoint(out / 'best.pt', model, [], done, sft_config=vars(args), validation_loss=val_loss)
                 last_time = time.perf_counter()  # 验证花的时间不算进剩余时间
             if record:
                 log.write(json.dumps(record) + "\n")
                 log.flush()
             if done % args.save_every == 0 or done == steps:
-                save_checkpoint(out / "ckpt.pt", model, optimizers, done, sft_config=vars(args))
-    return dict(step=steps, loss=loss_value, val_loss=val_loss, tokens=learned)
+                save_checkpoint(out / "ckpt.pt", model, optimizers, done, sft_config=vars(args), rng=rng_state(),
+                                sft_progress=dict(answer_tokens=learned, best_val=best_val, best_step=best_step))
+    summary = dict(step=steps, loss=loss_value, val_loss=val_loss, tokens=learned, best_val=best_val, best_step=best_step)
+    (out / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    return summary
 
 
 def parse_args(argv=None):
@@ -166,12 +220,20 @@ def parse_args(argv=None):
     g.add_argument("--log-every", type=int, default=10)
     g.add_argument("--eval-every", type=int, default=100)
     g.add_argument("--eval-batches", type=int, default=20)
+    g.add_argument('--eval-batch-size', type=int, default=0)
+    g.add_argument('--eval-micro-batch-size', type=int, default=0)
+    g.add_argument('--eval-before', action='store_true')
     g.add_argument("--save-every", type=int, default=200)
     g.add_argument("--resume", action="store_true")
 
     g = p.add_argument_group("硬件")
     g.add_argument("--device", default="auto")
     g.add_argument("--no-compile", action="store_true")
+    g.add_argument('--no-checkpoint', action='store_true')
+    g.add_argument('--attention-backend', choices=('flex', 'cudnn'), default='flex')
+    g.add_argument('--autotune', action='store_true')
+    g.add_argument('--cuda-graph', action='store_true')
+    g.add_argument('--gpu-memory-fraction', type=float, default=0.)
     args = p.parse_args(argv)
     if args.out is None:
         name = Path(args.data).stem.split("-")[0]

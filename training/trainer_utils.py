@@ -249,13 +249,36 @@ def clip_gradients(params, max_norm: float) -> torch.Tensor | None:
         return None
     params = list(params)
     # foreach 是一次处理一批张量的快速实现；MPS 上 PyTorch 不支持，硬要用会报错，交给 PyTorch 自己选
-    return torch.nn.utils.clip_grad_norm_(params, max_norm, foreach=True if params and params[0].is_cuda else None)
+    return torch.nn.utils.clip_grad_norm_(params, max_norm, error_if_nonfinite=True,
+                                         foreach=True if params and params[0].is_cuda else None)
 
 
 def step_optimizers(optimizers: list[torch.optim.Optimizer]) -> None:
     for opt in optimizers:
         opt.step()
         opt.zero_grad(set_to_none=True)
+
+
+def rng_state() -> dict:
+    """Save sampling/dropout state without initializing CUDA in a CPU process."""
+    import random
+    import numpy as np
+    result = dict(torch=torch.get_rng_state(), python=random.getstate(), numpy=np.random.get_state())
+    if torch.cuda.is_initialized():
+        result['cuda'] = torch.cuda.get_rng_state_all()
+    return result
+
+
+def restore_rng(state: dict | None) -> None:
+    if not state:
+        return
+    import random
+    import numpy as np
+    torch.set_rng_state(state['torch'])
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    if 'cuda' in state:
+        torch.cuda.set_rng_state_all(state['cuda'])
 
 
 # ---------- 运行目录：一次完整训练的各个阶段都放在同一个目录下（默认 out/small），每个阶段写到 <运行目录>/<阶段>/ckpt.pt，
@@ -293,12 +316,16 @@ def save_checkpoint(path: Path, model: LanguageModel, optimizers: list, step: in
 
 def load_checkpoint(path: Path, device: torch.device, mmap: bool = False) -> dict:
     """mmap=True：张量按需从文件里读，不一次全读进内存（多卡时每个进程都要读同一个存档）。"""
+    path = Path(path)
+    if path.is_dir() or path.suffix == '.safetensors':
+        from inference.artifact import read_artifact
+        return read_artifact(path, device=device)
     return torch.load(path, map_location=device, weights_only=False, mmap=mmap)
 
 
 def load_model(path: Path, device: torch.device) -> LanguageModel:
     """只要模型（接着训练、生成、评测时用）。"""
-    state = load_checkpoint(path, device)
+    state = load_checkpoint(path, torch.device('cpu'), mmap=True)
     model = LanguageModel(ModelConfig.from_json(state["model_config"])).to(device)
     model.load_state_dict(state["model"])
     return model
@@ -322,6 +349,8 @@ def resume(path: Path, model: LanguageModel, optimizers: list, device: torch.dev
     if rows_per_step is not None and saved is not None and saved != rows_per_step:
         raise ValueError(f"存档每步 {saved} 个片段，这次每步 {rows_per_step} 个（批大小 × 累积 × 卡数）。"
                          f"每步取哪些片段由步数决定，要接着训，这个乘积要和存档一样，比如 8 张卡就用 --batch-size {max(1, saved // 8)} --grad-accum 1")
+    if len(state.get('optimizers',[]))!=len(optimizers):
+        raise ValueError('Resuming requires the full optimizer checkpoint; a model-only checkpoint can only initialize a new stage')
     model.load_state_dict(state["model"])
     for opt, opt_state in zip(optimizers, state["optimizers"]):
         opt.load_state_dict(shard(opt, opt_state) if shard else opt_state)

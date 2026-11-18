@@ -26,6 +26,7 @@ COMMANDS = {
     "diagnose": ("tools.diagnose", "诊断：生成重复、和损失对不上时，分清是数据、计算路径还是训练不够"),
     "demo": ("tools.demo", "在一个 2300 万参数的小模型上把整条链跑一遍"),
     "tensorboard": ("tools.tensorboard", "把训练日志同步成 TensorBoard"),
+    "export": ("tools.export", "导出包含配置和分词器的 safetensors 模型"),
     "judge-check": ("tools.judge_check", "检查评审模型打分靠不靠谱"),
 }
 

@@ -8,6 +8,7 @@
     paragraphs             n       恰好 n 段（空行分段；sep 可以换成别的分隔，比如 ***）
     nth_paragraph          n, i, word   恰好 n 段（空行分段），第 i 段以 word 开头
     include / exclude      words   这些词都要出现 / 一个都不能出现
+    fact                   aliases, forbidden  至少保留一个等价说法，且不混入已作废的信息
     keyword_freq           word, n, relation   某个词出现的次数
     word_count / sentence_count  n, relation   英文词数 / 句子数
     letter_freq            letter, n, relation 某个字母出现的次数
@@ -88,6 +89,7 @@ CHECKS = {
     "paragraphs": lambda t, c: len(_paragraphs(t, c.get("sep"))) == c["n"],
     "nth_paragraph": lambda t, c: len(_paragraphs(t)) == c["n"] and _paragraphs(t)[c["i"] - 1].lower().startswith(c["word"].lower()),
     "include": lambda t, c: all(_count(t, w) > 0 for w in c["words"]),
+    "fact": lambda t, c: any(w in t for w in c["aliases"]) and not any(w in t for w in c.get("forbidden", [])),
     "exclude": lambda t, c: not any(_count(t, w) > 0 for w in c["words"]),
     "keyword_freq": lambda t, c: _relation(_count(t, c["word"]), c),
     "word_count": lambda t, c: _relation(_words(t), c),
@@ -122,5 +124,6 @@ def check(text: str, constraints: list[dict]) -> list[bool]:
 
 
 def reward(episode, task) -> float:
+    if not episode.text.strip():return 0.
     results = check(episode.text, json.loads(task["constraints"]))
     return sum(results) / len(results) if results else 0.0

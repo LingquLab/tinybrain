@@ -123,7 +123,7 @@ def build_model(args, vocab_size: int, device: torch.device, parent: dict | None
     if args.init or parent is not None:
         if changes:
             raise ValueError(f"从存档出发时模型设置取自存档，不能再改：{'、'.join(changes)}")
-        state = parent if parent is not None else load_checkpoint(Path(args.init), device)
+        state = parent if parent is not None else load_checkpoint(Path(args.init), torch.device('cpu'), mmap=True)
         model = LanguageModel(ModelConfig.from_json(state["model_config"])).to(device)
         model.load_state_dict(state["model"])
         origin = f"从 {args.init} 出发" if parent is None else f"从 {args.cooldown_from} 第 {state['step']} 步分出的退火分支"
@@ -214,12 +214,20 @@ def run_training(args, zero: Zero, device: torch.device) -> dict:
 
     # 模型和优化器
     model, origin = build_model(args, train_data.vocab_size, device, parent)
-    model.gradient_checkpointing = device.type == "cuda"
+    model.gradient_checkpointing = device.type == "cuda" and not args.no_checkpoint
     model.checkpoint_policy = args.checkpoint_policy
     zero.setup(model)
     windows = train_data.windows(args.seq_len)
     rows_per_step = args.batch_size * args.grad_accum * zero.world
     optimizers = optimizers_from_args(model, args)
+    if args.init_optimizer_state and not args.resume:
+        initial=load_checkpoint(Path(args.init),torch.device('cpu'),mmap=True)
+        if len(initial['optimizers'])!=len(optimizers):
+            raise ValueError('Initialization optimizer count differs')
+        for optimizer,saved in zip(optimizers,initial['optimizers']):
+            optimizer.load_state_dict(zero.shard(optimizer,saved))
+        say(f"Restored optimizer moments from step {initial['step']}; new data and schedule start at zero.")
+        del initial
     if parent is not None:  # 退火分支：优化器状态接着主线，学习率从主线这一步的值降到底
         steps = branch_start + args.cooldown_steps
         for opt, opt_state in zip(optimizers, parent["optimizers"]):
@@ -349,6 +357,7 @@ def parse_args(argv=None):
     g.add_argument("--moe-experts", type=int, default=None, help="专家数，0 是不用 MoE")
     g.add_argument("--set", nargs="*", default=[], metavar="名字=值", help="lm/config.py 里其他的设置，比如 engram_layers=(1,5)")
     g.add_argument("--init", default="", help="从这个存档的模型参数出发（退火用），优化器从头开始")
+    g.add_argument('--init-optimizer-state',action='store_true',help='Restore optimizer moments from --init while starting the new corpus and schedule at zero')
 
     g = p.add_argument_group("训练")
     g.add_argument("--epochs", type=float, default=1.0, help="把数据过几遍（可以是小数）；没给 --steps 时按它算")
@@ -378,12 +387,15 @@ def parse_args(argv=None):
     g = p.add_argument_group("硬件")
     g.add_argument("--device", default="auto", help="auto、cuda、mps 或 cpu")
     g.add_argument("--no-compile", action="store_true", help="CUDA 上也不用 torch.compile")
+    g.add_argument('--no-checkpoint', action='store_true', help='Disable activation recomputation when GPU memory permits')
     g.add_argument("--cuda-graph", action="store_true", help="捕获融合 Adam 和 Muon 更新图；只支持 CUDA 普通前馈模型、自定义 Muon")
     g.add_argument("--checkpoint-policy", choices=["selective", "full"], default="selective", help="选择性重算或整层重算")
     g.add_argument("--gpu-memory-fraction", type=float, default=0.0, help="限制 PyTorch CUDA 分配预算；0 不限制，例如 0.85 留出驱动和桌面显存")
     g.add_argument("--autotune", action="store_true", help="为固定形状搜索更快的矩阵和注意力内核；首次启动编译更久")
     g.add_argument("--attention-backend", choices=["flex", "cudnn"], default="flex", help="flex：FlexAttention 窗口内核；cudnn：NVIDIA cuDNN 原生窗口前向和反向（要装 .[cudnn]）")
     args = p.parse_args(argv)
+    if args.init_optimizer_state and (not args.init or args.cooldown_from):
+        p.error('--init-optimizer-state requires --init and cannot be combined with --cooldown-from')
     if args.eval_batch_size < 0 or args.eval_micro_batch_size < 0:
         p.error("验证批大小必须是正数，或用 0 跟随训练批大小")
     if not args.cooldown_from:  # 退火分支的默认值要读了存档才知道，在 train 里补

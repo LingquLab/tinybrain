@@ -35,9 +35,9 @@ def reply(model, fmt: ChatFormat, messages: list[dict], max_new: int = 512, temp
         if room <= 0:
             return "（对话太长了，请 /清空 重新开始）", added
         out = generate(model, torch.tensor([prompt], device=device), room, temperature=temperature, top_k=top_k, eos_id=fmt.end)
-        text, calls, broken = fmt.parse_turn(out[0, len(prompt):].tolist())
+        text, calls, broken = fmt.parse_turn(out[0, len(prompt):].tolist(),allow_plain_calls=env is not None)
         added.append({"role": "assistant", "content": text, **({"tool_calls": calls} if calls else {})})
-        if not calls or env is None:
+        if (not calls and not broken) or env is None:
             return text, added
         results = [env.call(c["name"], c["arguments"]) for c in calls] + [f"工具调用格式错误：{b[:200]}" for b in broken]
         added.append({"role": "tool", "content": "\n".join(results)})
@@ -61,7 +61,8 @@ def main(argv=None, input_fn=input, print_fn=print):
         print_fn(f"用的存档：{args.ckpt}")
     device = pick_device(args.device)
     model = load_model(args.ckpt, device)
-    fmt = ChatFormat(Tokenizer(DEFAULT_MODEL))
+    from .artifact import tokenizer_path
+    fmt = ChatFormat(Tokenizer(tokenizer_path(args.ckpt, DEFAULT_MODEL)))
     env = None
     if args.tools:
         from training.rewards.tools import ToolEnv

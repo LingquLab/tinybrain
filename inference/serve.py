@@ -239,7 +239,7 @@ def load_for_serving(ckpt: str, device: torch.device) -> tuple[LanguageModel, di
     model = LanguageModel(ModelConfig.from_json(state["model_config"]))
     model.load_state_dict(state["model"])
     model = model.to(device).eval()
-    stage = Path(ckpt).parent.name
+    stage = state.get('artifact_metadata', {}).get('stage', Path(ckpt).parent.name)
     report = model.param_report()
     info = dict(ckpt=str(ckpt), stage=stage, step=state.get("step"), params=report["合计"], trunk=report["主干"],
                 kind="base" if stage in BASE_STAGES or stage.startswith("cooldown") else "chat")
@@ -258,7 +258,8 @@ def main(argv=None):
     ckpt = args.ckpt or str(find_stage(args.run, ("rl", "mopd", "sft", "anneal", "pretrain")))
     model, info = load_for_serving(ckpt, pick_device(args.device))
     name = args.name or f"{Path(ckpt).parent.parent.name}/{info['stage']}"
-    server = make_server(Service(model, ChatFormat(Tokenizer(DEFAULT_MODEL)), name, info), args.host, args.port)
+    from .artifact import tokenizer_path
+    server = make_server(Service(model, ChatFormat(Tokenizer(tokenizer_path(ckpt, DEFAULT_MODEL))), name, info), args.host, args.port)
     print(f"存档 {ckpt}（{info['stage']}，第 {info['step']} 步）。浏览器打开 http://{args.host}:{args.port}/ 聊天；"
           f"接口在 http://{args.host}:{args.port}/v1", flush=True)
     server.serve_forever()

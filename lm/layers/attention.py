@@ -91,11 +91,11 @@ class Attention(nn.Module):
             return _cudnn_attention(q, k, v, is_causal=True,
                                     window_left=self.window if self.window is not None else -1,
                                     return_lse=True)[0]
-        if q.is_cuda and q.size(-1) >= 16:
+        if q.is_cuda and self.backend == 'flex' and q.size(-1) >= 16:
             if self._flex_length != length or self._flex_mask is None:
                 self.prepare(length, q.device)
             return _flex_attention(q, k, v, block_mask=self._flex_mask, enable_gqa=True)
-        if self.window is None:
+        if self.window is None or self.window >= length:
             return grouped_attention(q, k, v, is_causal=True)
         pos = torch.arange(length, device=q.device)
         mask = (pos[:, None] >= pos[None, :]) & (pos[:, None] - pos[None, :] < self.window)

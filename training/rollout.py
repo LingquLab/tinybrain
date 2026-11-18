@@ -2,12 +2,26 @@
 from dataclasses import dataclass, field
 
 import torch
+import torch.nn.functional as F
 
 from inference.generate import generate
 from inference.template import ChatFormat
 from inference.tokenizer import PAD
 from lm import LanguageModel
-from lm.loss import token_log_probs
+
+
+class PlainFormat:
+    """Document-style prompts for RL directly on a pretrained base model."""
+    def __init__(self, tok):
+        self.tok, self.end = tok, tok.eos_id
+
+    def prompt(self, messages):
+        if len(messages) != 1 or messages[0]['role'] != 'user':
+            raise ValueError('Plain base-model RL requires exactly one user prompt')
+        return [self.end] + self.tok.encode(messages[0]['content'])
+
+    def answer(self, ids):
+        return self.tok.decode(cut_at(list(ids), self.end)[0]).strip()
 
 
 @dataclass
@@ -36,18 +50,31 @@ def keep_fitting(model, fmt, rows: list[dict], max_new: int, what: str) -> list[
     return kept
 
 
+def balanced_tasks(rows,limit):
+    """Round-robin categories so a prefix-limited evaluation covers every category."""
+    pools={}
+    for row in rows:pools.setdefault(row.get('category') or row.get('domain') or row['reward'],[]).append(row)
+    selected=[]
+    for offset in range(max(map(len,pools.values()),default=0)):
+        for pool in pools.values():
+            if offset<len(pool):
+                selected.append(pool[offset])
+                if len(selected)==limit:return selected
+    return selected
+
+
 def cut_at(ids: list[int], stop: int) -> tuple[list[int], bool]:
     """截到第一个停止符（包括它）为止；没有停止符就是没写完。"""
     return (ids[: ids.index(stop) + 1], True) if stop in ids else (ids, False)
 
 
 def sample_group(model: LanguageModel, fmt: ChatFormat, messages: list[dict], n: int, max_new: int, temperature: float = 1.0,
-                 top_k: int | None = None, generator: torch.Generator | None = None) -> list[Episode]:
+                 top_k: int | None = None, generator: torch.Generator | None = None, fast: bool | None = None) -> list[Episode]:
     """同一条提示采 n 个回答（同一条提示长度一样，可以整批一起生成）。"""
     device = next(model.parameters()).device
     prompt = fmt.prompt(messages)
     idx = torch.tensor([prompt] * n, device=device)
-    out = generate(model, idx, max_new, temperature=temperature, top_k=top_k, eos_id=fmt.end, generator=generator)
+    out = generate(model, idx, max_new, temperature=temperature, top_k=top_k, eos_id=fmt.end, generator=generator, fast=fast)
     episodes = []
     for row in out[:, len(prompt):].tolist():
         resp, finished = cut_at(row, fmt.end)
@@ -70,7 +97,7 @@ def run_agent(model: LanguageModel, fmt: ChatFormat, messages: list[dict], env, 
         out = generate(model, torch.tensor([ids], device=device), room, temperature=temperature, top_k=top_k, eos_id=fmt.end, generator=generator)
         resp, done = cut_at(out[0, len(ids):].tolist(), fmt.end)
         ids, learn = ids + resp, learn + [1] * len(resp)
-        text, calls, broken = fmt.parse_turn(resp)
+        text, calls, broken = fmt.parse_turn(resp,allow_plain_calls=True)
         turn = dict(text=text, calls=calls, broken=broken, results=[])
         turns.append(turn)
         if not done:
@@ -99,5 +126,7 @@ def collate(episodes: list[Episode], device: torch.device) -> tuple[torch.Tensor
 
 
 def token_logprobs(model: LanguageModel, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """每个位置上，模型给目标词的对数概率，(B, T)。用稳定写法（lm/loss.py）：把握极大的词梯度也不会算错，RL 后期这样的词很多。"""
-    return token_log_probs(model(x).logits, y)
+    """每个位置上，模型给目标词的对数概率，(B, T)。"""
+    logits = model(x).logits
+    from lm.loss import token_log_probs
+    return token_log_probs(logits, y)

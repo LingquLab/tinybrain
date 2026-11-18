@@ -276,7 +276,8 @@ def poetry_pool(rnd: random.Random, poems) -> list[dict]:
 
 
 def _num(x: Fraction) -> str:
-    return str(x.numerator) if x.denominator == 1 else f"{float(x):.4g}"
+    from training.rewards.math import exact_decimal
+    return exact_decimal(x)
 
 
 def agent_pool(rnd: random.Random, n: int) -> list[dict]:
@@ -421,11 +422,62 @@ def _write(path: Path, rows: list[dict], schema: pa.Schema) -> None:
     tmp.rename(path)
 
 
+def build_zero_arithmetic(directory: Path, seed: int = 0, easy: bool = False) -> dict:
+    """Small verifiable RL pilot; split by calculation before creating prompts."""
+    import hashlib
+    rnd = random.Random(seed)
+    pools = {'add': [], 'subtract': [], 'multiply': [], 'two_step': []}
+    for a in range(31):
+        for b in range(a + 1):
+            pools['add'].append((f'{a}+{b}', a + b))
+            pools['subtract'].append((f'{a}-{b}', a - b))
+            if a <= 12:
+                pools['multiply'].append((f'{a}*{b}', a * b))
+    for a in range(13):
+        for b in range(a + 1):
+            for c in range(13):
+                if a + b >= c:
+                    pools['two_step'].append((f'{a}+{b}-{c}', a + b - c))
+    train, evaluation = [], []
+    counts = {'add': (240, 24), 'subtract': (192, 24), 'multiply': (64, 16), 'two_step': (144, 32)}
+    if easy:
+        pools={kind:[(e,a) for e,a in pools[kind] if max(map(int,re.findall(r'\d+',e)))<10] for kind in ['add','subtract']}
+        counts={'add':(40,12),'subtract':(40,12)}
+    for kind, pool in pools.items():
+        rnd.shuffle(pool)
+        n_train, n_eval = counts[kind]
+        for split, selected in [(train, pool[:n_train]), (evaluation, pool[n_train:n_train + n_eval])]:
+            for expression, answer in selected:
+                styles = [f'{expression}=', f'问题：{expression}等于多少？\n答案：',
+                          f'计算{expression}，可以逐步推理，最后写“答案：”和结果。\n解：']
+                if easy:styles=styles[:1]
+                row = task(rnd.choice(styles), 'math_strict', '数学', answer=str(answer))
+                row.pop('_key');row['calculation'] = expression;row['category'] = kind
+                split.append(row)
+    rnd.shuffle(train);rnd.shuffle(evaluation)
+    assert not ({t['calculation'] for t in train} & {t['calculation'] for t in evaluation})
+    directory = Path(directory);directory.mkdir(parents=True, exist_ok=True)
+    schema = pa.schema(list(TASK_SCHEMA) + [pa.field('calculation', pa.string()), pa.field('category', pa.string())])
+    _write(directory/'train.parquet', train, schema);_write(directory/'eval.parquet', evaluation, schema)
+    metadata = dict(generator='integer arithmetic, calculated by Python; no teacher solutions or SFT', seed=seed,
+                    easy=easy,
+                    train=len(train), evaluation=len(evaluation), split_unit='calculation; commutative operands canonicalized',
+                    counts=counts, files={name: hashlib.sha256((directory/name).read_bytes()).hexdigest()
+                                        for name in ['train.parquet', 'eval.parquet']})
+    (directory/'provenance.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+    return metadata
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="RL 题目、评测题和 MOPD 提示")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--scale", type=float, default=1.0, help="每种题的数量乘这个数（试跑时用小一点）")
+    parser.add_argument('--zero-arithmetic', type=Path, help='Generate an independent arithmetic RL pilot in this directory')
+    parser.add_argument('--easy',action='store_true',help='Single-digit addition/subtraction with document-style equation prompts')
     args = parser.parse_args(argv)
+    if args.zero_arithmetic:
+        result = build_zero_arithmetic(args.zero_arithmetic, args.seed, easy=args.easy)
+        print(json.dumps(result, ensure_ascii=False));return result
     result = build(args.seed, args.scale)
     print(f"{'题型':<10}{'原始':>8}{'去重后':>8}{'RL':>8}{'评测':>6}")
     for kind, s in result["kinds"].items():

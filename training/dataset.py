@@ -7,18 +7,24 @@
 
 训练按「轮」走（ordered_batch）：把数据切成不重叠的等长片段，每轮按种子打乱一次，依次取完——一轮里每个片段恰好一次。
 第几批取哪些片段只由种子和批次序号决定，所以中断后接着跑和一口气跑完一样。验证集用 batch()：按种子随机截，每次同一批。
-文件用内存映射打开，多大都不占内存。
+文件用内存映射取得长度；训练片段按小块读取，避免随机访问大语料时映射页面逐渐驻留在进程内存中。
 
 对话数据（SFT）是另一种格式，meta.json 里 "format": "packed"：
     train.ids.bin、train.mask.bin   一行行等长的词编号和损失遮罩（每行 row_len 个），一段对话不会跨行
     val.ids.bin、val.mask.bin       验证集，格式一样
 训练时每轮把所有行打乱一遍依次取；遮罩为 0 的位置，目标记成 -1，不算损失。open_data 按 meta 自动选对读法。
 """
+from __future__ import annotations
+
 import json
+from collections import OrderedDict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
+
+if TYPE_CHECKING:
+    import torch
 
 from inference.tokenizer import PAD
 
@@ -83,10 +89,36 @@ class TokenData:
             raise FileNotFoundError(f"{directory} 里没有 meta.json，这不是一个准备好的训练数据目录")
         self.meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
         self.vocab_size = self.meta["vocab_size"]
-        files = sorted(directory.glob(f"{split}-*.bin"))
-        self.shards = [np.memmap(f, dtype=self.meta["dtype"], mode="r") for f in files if f.stat().st_size]
+        self.files = [f for f in sorted(directory.glob(f"{split}-*.bin")) if f.stat().st_size]
+        self.shards = [np.memmap(f, dtype=self.meta["dtype"], mode="r") for f in self.files]
+        self._dtype = np.dtype(self.meta["dtype"])
+        self._readers = OrderedDict()
         self.n_tokens = sum(len(s) for s in self.shards)
         self._orders = {}
+
+    def _read_window(self, shard: int, start: int, length: int) -> np.ndarray:
+        """Read only this window, keeping at most 16 shard handles open."""
+        reader = self._readers.pop(shard, None)
+        if reader is None:
+            if len(self._readers) >= 16:
+                _, oldest = self._readers.popitem(last=False)
+                oldest.close()
+            reader = open(self.files[shard], "rb")
+        self._readers[shard] = reader
+        reader.seek(start * self._dtype.itemsize)
+        block = reader.read(length * self._dtype.itemsize)
+        if len(block) != length * self._dtype.itemsize:
+            raise IOError(f"Short token read from {self.files[shard]} at token {start}")
+        return np.frombuffer(block, dtype=self._dtype)
+
+    def close(self):
+        for reader in self._readers.values():
+            reader.close()
+        self._readers.clear()
+
+    def __del__(self):
+        for reader in getattr(self, "_readers", {}).values():
+            reader.close()
 
     def windows(self, seq_len: int) -> int:
         """一轮有多少个片段：每个文件切成不重叠的 seq_len 段（每段多带一个词当最后一个目标），片段不跨文件。"""
@@ -94,6 +126,8 @@ class TokenData:
 
     def ordered_batch(self, batch_size: int, seq_len: int, index: int, seed: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """训练用的第 index 批（从 0 数）：按轮依次取，一轮里每个片段恰好一次。返回 (输入, 目标)。"""
+        import torch
+
         key = (seq_len, seed)
         if key not in self._orders:
             per_file = np.array([(len(s) - 1) // seq_len for s in self.shards])
@@ -105,7 +139,7 @@ class TokenData:
         for w in order.take(index * batch_size, batch_size):
             f = int(np.searchsorted(first, w, side="right")) - 1
             start = int(w - first[f]) * seq_len
-            rows.append(self.shards[f][start:start + seq_len + 1])
+            rows.append(self._read_window(f, start, seq_len + 1))
         block = _to_device(torch.from_numpy(np.stack(rows).astype(np.int64)), device)
         return block[:, :-1], block[:, 1:]
 
@@ -114,6 +148,8 @@ class TokenData:
 
     def batch(self, batch_size: int, seq_len: int, seed: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """返回 (输入, 目标)，都是 (batch_size, seq_len)；目标是输入往后错一位。同一个 seed 给出同一批。"""
+        import torch
+
         room = np.array([len(s) - seq_len for s in self.shards], dtype=np.float64)  # 每个文件里有多少个可用的起点
         if (room <= 0).all():
             raise ValueError(f"没有哪个数据文件比一个片段（{seq_len + 1} 个词）长")
@@ -123,7 +159,7 @@ class TokenData:
         rows = []
         for i in which:
             start = int(rng.integers(0, int(room[i])))
-            rows.append(self.shards[i][start:start + seq_len + 1])
+            rows.append(self._read_window(int(i), start, seq_len + 1))
         block = _to_device(torch.from_numpy(np.stack(rows).astype(np.int64)), device)
         return block[:, :-1], block[:, 1:]
 
@@ -156,6 +192,8 @@ class PackedData:
             raise ValueError(f"这份对话数据是按片段长度 {self.row_len - 1} 打包的，训练时 --seq-len 也要用这个值（收到 {seq_len}）")
 
     def _rows(self, rows: np.ndarray, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        import torch
+
         ids = torch.from_numpy(self.ids[rows].astype(np.int64))
         mask = torch.from_numpy(self.mask[rows].astype(np.bool_))
         x, y = ids[:, :-1], ids[:, 1:].masked_fill(~mask[:, 1:], -1)
@@ -211,6 +249,8 @@ class MixedData:
         return self.batch(batch_size, seq_len, seed=seed * 1_000_000_007 + index, device=device)
 
     def batch(self, batch_size: int, seq_len: int, seed: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        import torch
+
         which = np.random.default_rng(seed).choice(len(self.parts), size=batch_size, p=self.weights)
         xs, ys = [], []
         for i, part in enumerate(self.parts):
@@ -224,7 +264,7 @@ class MixedData:
 
 def open_mixed(spec: str, split: str = "train"):
     """「目录」或「目录A:0.9,目录B:0.1」。只有一个目录时就是 open_data。"""
-    if "," not in spec and ":" not in spec.rsplit("/", 1)[-1]:
+    if "," not in spec and ":" not in spec.replace('\\', '/').rsplit("/", 1)[-1]:
         return open_data(spec, split)
     parts = []
     for item in spec.split(","):

@@ -125,7 +125,8 @@ def continue_text(ckpt: str, prompt: str, max_new: int = 100, temperature: float
                   device: str = "auto", tokenizer: str | None = None, seed: int = 0) -> str:
     """返回模型接在 prompt 后面写出的文字（不含 prompt 本身）。默认在前 50 名内按温度 0.8 采样；temperature=0 才每步取概率最大的词。"""
     model = load_model(ckpt, pick_device(device))
-    return _continue(model, Tokenizer(tokenizer or DEFAULT_MODEL), prompt, max_new, temperature, top_k, seed)
+    from .artifact import tokenizer_path
+    return _continue(model, Tokenizer(tokenizer or tokenizer_path(ckpt, DEFAULT_MODEL)), prompt, max_new, temperature, top_k, seed)
 
 
 def parse_args(argv=None):
@@ -146,7 +147,8 @@ def main(argv=None):
     ckpt = args.ckpt or str(find_stage(args.run, ("anneal", "pretrain")))
     if args.ckpt is None:
         print(f"用的存档：{ckpt}")
-    model, tok = load_model(ckpt, pick_device(args.device)), Tokenizer(DEFAULT_MODEL)
+    from .artifact import tokenizer_path
+    model, tok = load_model(ckpt, pick_device(args.device)), Tokenizer(tokenizer_path(ckpt, DEFAULT_MODEL))
     texts = []
     for prompt in [args.prompt] if args.prompt else DEMO_PROMPTS:
         texts.append(_continue(model, tok, prompt, args.max_new, args.temperature, args.top_k, args.seed))

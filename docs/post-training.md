@@ -236,11 +236,53 @@ out/<档>/<阶段>/    每个阶段的存档
 
 ## 还没定的（文档里先按默认值写）
 
-1. **退火的长度**：默认最后 10% 的步数（对话数据占一成已定）。
+1. **当前交付退火方案已定**：Small、Medium 在统一 token 步数 554000 开始 Cos；首段 20000 个参考步，30% 对话、40% 教材/基础知识、30% 普通预训练。后续按实际回答质量决定是否继续，见下节。
 2. **三份 SFT 语料各放哪些数据集**：见下面附录的取舍。
 3. **agent RL 的工具和任务**：先用自己做的，见上。
 4. **RLAIF 的评分细则**：初稿在 `docs/rlaif-rubric.md`；用好回答和弄坏的回答做过一次自动检查（通用、古文、诗词分得清好坏，结果在细则文档里），还没和人工打分对比。
 5. **古文诗词的评测**：内容待定。
+
+## 当前交付的 Cos 与质量验收（2026-11-17）
+
+统一参考步按累计训练 token 除以 32768 计算。Small 的原生第 554000 步与 Medium 的原生第 288500 步都对应 18,153,472,000 个 token；Medium 主线的映射为 `reference_step = 2 * native_step - 23000`。监控进程先固定并验证该检查点，再停止匹配 PID、创建时间和输出目录的原预训练进程。原模型、优化器状态和恢复信息保留。
+
+首段 Cos 增加 655,360,000 个 token：Small 有 20000 次更新，Medium 有 10000 次更新。阶段日志仍进入原 TensorBoard，Cos 横轴用累计 token 对齐。当前运行的任务、切换身份和验收入口保存在 `out/delivery/{small,medium}-phase1.json`、`*-cos-switch.json`。
+
+两边各自比较冻结的切换前模型与 Cos 后模型，题目、种子和采样参数一致：
+
+- 原 base 验证集 64×2048 token 的 loss/BPB。
+- 完整 600 题的候选答案评分，只作诊断，同时报告原始与按 UTF-8 字节归一化的准确率。
+- 400 道基础题的对话式自由生成和 200 道纯文本提示，每题采样两次；分别报告算术、阅读、逻辑和格式，正确与 EOS 完成率分别记录。
+- 72 道冻结探针，两种提示格式各采样两次：科学、生物、地理、单位、文学、翻译、基础代码、长上下文、多轮对话与开放回答。62 道严格短答案题使用明确别名；10 道开放题保留参考要点，未经语义审查时不生成虚假的正确率或奖励。
+- 550 道公开来源的可验证任务；不具备当前验证依赖的题型显式列入排除统计。公开语料的预训练重合不作无泄漏保证。
+
+用户选择的标准是可用的回答质量和正确率。评估按领域检查实际生成，审阅开放回答；训练结束、loss 降低、格式分或候选排序单独变好均不足以通过。`cos-validation/quality-decision.json` 记录带证据的判断；只有通过并固定 `anneal-selected.pt` 后，SFT 才继续。未通过则保留权重与优化器状态，继续低学习率 Cos。验收文件由执行评估的代理写入，无须用户逐轮审批。
+
+续段不能沿用已经降到零的学习率。`training.pipeline anneal` 支持 `--lr-reference` 指向冻结的切换前检查点，恢复该时刻的低学习率再作一段余弦衰减；`--source` 仍指向上一段最后的模型和优化器，`--round-index` 改变确定性数据排列。每段 `lineage.json` 保留累计 token、来源、学习率依据和优化器恢复记录。
+
+```bash
+python -m training.pipeline anneal \
+  --source out/medium/delivery/anneal/ckpt.pt \
+  --lr-reference out/medium/delivery/pretrain-554000/ckpt.pt \
+  --round-index 1 \
+  --data data/tokens/anneal-small-v2 --out out/medium/delivery/anneal-round2 \
+  --batch-size 32 --grad-accum 1 --tokens 655360000 \
+  -- --attention-backend cudnn --no-checkpoint --autotune --log-every 50
+```
+
+本地用户已关闭主机内存守护与 14 GiB 进程硬上限；不要重新启用 `training.memory_guard` 或给训练包装 `limit_memory`。文件传输按 4 MiB 窗口安排预取，避免整份检查点进入预取缓存。这是传输算法的缓冲区大小，与自动停训保护无关。
+
+奖励裁判固定使用 ModelScope 的 `Qwen/Qwen3.8-27B-FP8`，冻结推理权重并关闭 thinking。启动前验证下载哈希与推理环境；用于 RLAIF 前分别通过已知事实/评分注入/弃答控制和冻结语料好坏回答对照。数学、代码等任务仍使用程序验证器。
+
+Cos 质量验收和阶段一 SFT 完成后，两边的阶段二计划依次执行数学、代码、文学专家 SFT，1000 步 MOPD，600 步基础 RL、300 步公开任务 RL、300 步工具 RL，以及 400 步 RLAIF。具体命令和每阶段的完成证据写在 `out/delivery/{small,medium}-phase2.json`。专家使用同一份 4096 长度的数据；Small 微批 4、累积 4，Medium 批次 16。通用 MOPD 老师使用通用 SFT 模型，专项老师使用各自的最佳检查点。RLAIF 之前才启动云端 Qwen 服务，避免与大批次 SFT 争抢显存。
+
+每段 RL 都有独立验证、最佳模型和完整最后检查点；未超过初始验证成绩时保留初始模型作为最佳。MOPD 额外保存明确标为不可恢复优化器的 `last-model.pt`。`--resume` 拒绝优化器状态缺失或数量不一致的模型文件，避免在旧步数上静默重置优化器。
+
+MOPD 的 KL 在选择响应位置之后才转成 FP32 并做词表 softmax，避免为不参与目标的长提示分配整份 KL 中间张量；目标值和梯度已与先计算完整 KL 再遮罩的方式对照。正式 Medium MOPD 使用约 38 GiB 预算，在原预训练和大批次 SFT 结束后运行；与占用约 79 GiB 的原预训练并行进行的四教师压力试验没有完成，不作为完整训练通过的证据。
+
+云端完整阶段检查点在对应流水线的 `complete.json` 写入后才允许备份到 D 盘。原始字节、大小、哈希及文件身份校验通过后，释放云端完整检查点，保留云端最佳模型或 MOPD 的最后模型；备份日志先记录本地验证完成，再执行云端清理，支持中断恢复。原预训练检查点和仍可能续段的 Cos 检查点不在该自动归档名单。完整优化器检查点仍可从本地备份恢复。
+
+阶段二保留通用 SFT、基础 SFT、MOPD、各段 RL 的候选模型，按同题同种子验证生成正确率和语义质量。最终候选需要再过独立测试与实际加载验收。自动导出的 `rlaif-candidate` 只是候选备份，不能凭流水线结束或导出成功认定模型已经可用。
 
 ## 附录：SFT 数据的取舍（2026-11-13 抽样后）
 
@@ -279,4 +321,4 @@ out/<档>/<阶段>/    每个阶段的存档
 - SimpleRL-Zoo — https://arxiv.org/abs/2503.18892
 - Understanding R1-Zero-Like Training（Dr. GRPO） — https://arxiv.org/abs/2503.20783
 - There May Not be Aha Moment in R1-Zero-like Training — https://sail.sea.com/blog/articles/62
-- Qwen3.8-27B — https://kingy.ai/blog/qwen3-8-27b-specs-benchmarks-local-hardware/
+- Qwen3.8-27B-FP8 — https://www.modelscope.cn/models/Qwen/Qwen3.8-27B-FP8
