@@ -5,7 +5,7 @@
 [![PyTorch 2.5+](https://img.shields.io/badge/PyTorch-2.5%2B-e9482b)](https://pytorch.org)
 [![Dataset ModelScope](https://img.shields.io/badge/dataset-ModelScope-ffd21f)](https://www.modelscope.cn/datasets/caiwangzsnm/tinybrain-dataset)
 [![Video Bilibili](https://img.shields.io/badge/video-Bilibili-fb7299)](https://www.bilibili.com/video/BV1kqsj6EEtT/)
-[![Model in training](https://img.shields.io/badge/model-in%20training-lightgrey)](#status)
+[![ModelScope Chat RC1](https://img.shields.io/badge/ModelScope-Chat%20RC1-15965a)](#status)
 [![GitHub stars](https://img.shields.io/github/stars/logitcai/tinybrain?color=15965a)](https://github.com/logitcai/tinybrain/stargazers)
 
 **A Chinese-first small language model, built from scratch — starting from the data.**
@@ -21,11 +21,25 @@ tinybrain is a from-scratch language model project in the spirit of [nanochat](h
 
 ## Status
 
-2026-11-16. The model, data pipeline, four pretraining tiers, the full post-training stack and evaluation are written and tested, and the whole chain has been run end to end on a 23M-param demo model. **No trained weights have been released yet.**
+Small and Medium are available as Chinese chat research checkpoints dated November 19, 2026. Each release includes FP32 safetensors, the tokenizer and the matching TinyBrain runtime.
 
-- **medium** (499M) is pretraining on the base tier: validation loss 2.50 at about 6.1B tokens. small needed 7.4B tokens to reach 2.76.
-- **small** (167M) is also continuing on the base tier: 2.76 at about 7.4B tokens (step 226,400), on its fitted curve, which points to about 2.67 at the end of the tier (20.2B tokens).
-- Current checkpoints only continue text; they can't chat yet. `tinybrain serve` opens a chat page whose "continue" mode shows what they have learned. Post-training, weights and benchmark scores come after medium finishes.
+| ModelScope release | Parameters | Weight file | Usable sampled answers |
+| --- | ---: | ---: | ---: |
+| [Small Chat RC1](https://www.modelscope.cn/models/caiwangzsnm/TinyBrain-Small-Chat-20261119-RC1) | 167M | 639 MiB | 13/180 |
+| [Medium Chat RC1](https://www.modelscope.cn/models/caiwangzsnm/TinyBrain-Medium-Chat-20261119-RC1) | 499M | 1.86 GiB | 29/180 |
+
+Both checkpoints answered the same 90 development questions twice, with the same seed and temperature of 1.0. Qwen3.8-27B-FP8 graded each sampled answer against a reference. In a separate set of ten three-turn conversations, Medium ended all 30 replies normally and none scored at least 8/10. Independent final evaluation is pending.
+
+Run these commands in a Python 3.11+ environment to chat with Small.
+
+```bash
+python -m pip install modelscope
+modelscope download --model caiwangzsnm/TinyBrain-Small-Chat-20261119-RC1 --local_dir ./tinybrain-small
+python -m pip install ./tinybrain-small/tinybrain-0.1.0-py3-none-any.whl safetensors
+tinybrain chat ./tinybrain-small --device auto
+```
+
+Before post-training, the November 16 runs recorded validation losses of 2.50 for Medium at about 6.1B tokens and 2.76 for Small at about 7.4B tokens.
 
 ## What it costs
 
