@@ -257,7 +257,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     ckpt = args.ckpt or str(find_stage(args.run, ("rl", "mopd", "sft", "anneal", "pretrain")))
     model, info = load_for_serving(ckpt, pick_device(args.device))
-    name = args.name or f"{Path(ckpt).parent.parent.name}/{info['stage']}"
+    # 发布包（下载下来的目录）用目录名；训练存档用「运行目录/阶段」，比如 medium/sft
+    name = args.name or (Path(ckpt).resolve().name if Path(ckpt).is_dir() else f"{Path(ckpt).parent.parent.name}/{info['stage']}")
     from .artifact import tokenizer_path
     server = make_server(Service(model, ChatFormat(Tokenizer(tokenizer_path(ckpt, DEFAULT_MODEL))), name, info), args.host, args.port)
     print(f"存档 {ckpt}（{info['stage']}，第 {info['step']} 步）。浏览器打开 http://{args.host}:{args.port}/ 聊天；"
