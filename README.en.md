@@ -148,7 +148,7 @@ How it's made: per-document cleaning (mojibake, punctuation, traditional→simpl
 ## Training
 
 - Next-token cross-entropy, computed in a form that stays correct when the model is very confident (softplus of the margin; Barron et al., arXiv 2610.31642).
-- Muon for all matrices (Nesterov momentum, 5 Newton–Schulz iterations), Adam for embeddings, head, memory tables and scalars.
+- Muon for all matrices (Nesterov momentum, 5 Newton–Schulz iterations, decoupled weight decay 0.1 via `--weight-decay`), Adam for embeddings, head, memory tables and scalars.
 - Cosine or WSD learning-rate schedules; WSD runs can branch a cooldown from any checkpoint.
 - Epoch-based data order that is fully determined by the seed, so `--resume` gives the same result as an uninterrupted run.
 - Multi-GPU with ZeRO-1: launch with `torchrun --standalone --nproc-per-node 8 -m training.train_pretrain ...`. Each parameter is owned by one GPU, which receives its averaged gradient, updates it and broadcasts it back, so optimizer state is split across GPUs. Data order depends only on the seed and the step, so with the same rows per step (`--batch-size × --grad-accum × GPUs`) a multi-GPU run trains the same model as a single-GPU run, and checkpoints resume across the two. Pretraining only for now.

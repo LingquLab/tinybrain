@@ -173,7 +173,7 @@ def split_parameters(model: LanguageModel) -> dict[str, list]:
 
 
 def build_optimizers(model: LanguageModel, kind: str = "custom", matrix_lr: float = 0.02, embed_lr: float = 0.3, head_lr: float = 0.004,
-                     engram_lr: float = 0.3, scalar_lr: float = 0.01, weight_decay: float = 0.0, momentum: float = 0.95,
+                     engram_lr: float = 0.3, scalar_lr: float = 0.01, weight_decay: float = 0.1, momentum: float = 0.95,
                      adam_betas: tuple = (0.8, 0.95), adam_eps: float = 1e-10, muon_momentum_dtype: torch.dtype | None = None,
                      offload_adam: bool = False) -> list[torch.optim.Optimizer]:
     """返回 [Adam, Muon]，每个参数恰好归一组。Adam 那几组的学习率按 (dim/768)^-0.5 缩放；权重衰减只作用在矩阵上。
@@ -228,7 +228,7 @@ def add_optimizer_args(parser, lr_mult: float = 1.0) -> None:
     g.add_argument("--head-lr", type=float, default=0.004, help="输出层")
     g.add_argument("--engram-lr", type=float, default=0.3, help="Engram 记忆表（不做权重衰减）")
     g.add_argument("--scalar-lr", type=float, default=0.01, help="归一化系数、多流残差系数、流入口出口的查询向量")
-    g.add_argument("--weight-decay", type=float, default=0.0, help="只作用在 Muon 管的矩阵上")
+    g.add_argument("--weight-decay", type=float, default=0.1, help="只作用在 Muon 管的矩阵上（解耦：每步先乘 1 − 学习率 × 它）")
     g.add_argument("--adam-eps", type=float, default=1e-10,
                    help="Adam 的 ε。论文 arXiv 2610.31642：ε 越小，正确答案的领先幅度平衡在约 ln(1/ε)；1e-10 时约 23，超过 FP32 的临界值 16.6，"
                         "CUDA 上的融合交叉熵会出现梯度算错的位置；改成 1e-7 能避开，但会改变词向量、输出层、记忆表的学习动态")
