@@ -54,6 +54,8 @@ Measured on the 5070 Ti: 16 × 2048 per step, ~71k tokens/s, ~12.5 GiB peak memo
 
 ## Quick start
 
+For Ascend A5 inference, pretraining and two-rank TileXR commands, see the [Ascend guide](docs/ascend.md).
+
 ```bash
 git clone https://github.com/logitcai/tinybrain && cd tinybrain
 pip install -e ".[data]"        # Python 3.11+, PyTorch 2.5+; installs the `tinybrain` command

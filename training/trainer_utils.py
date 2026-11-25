@@ -17,11 +17,25 @@ from .muon import Muon
 # ---------- 设备
 
 def pick_device(name: str = "auto") -> torch.device:
-    """auto：有 CUDA 用 CUDA，其次是苹果的 MPS，都没有就用 CPU。"""
+    """训练和推理共用设备选择。auto 依次检查 CUDA、昇腾 NPU、MPS 和 CPU。"""
+    if name == "auto" and torch.cuda.is_available():
+        return torch.device("cuda")
+    if name == "auto" or name.split(":")[0] == "npu":
+        if not hasattr(torch, "npu"):
+            try:
+                import torch_npu  # 注册 npu 设备及 HCCL 后端
+            except ModuleNotFoundError as exc:
+                if exc.name != "torch_npu":
+                    raise
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            device = torch.device("npu" if name == "auto" else name)
+            if device.index is not None:
+                torch.npu.set_device(device)
+            return device
+        if name != "auto":
+            raise RuntimeError("NPU 不可用，请检查 torch_npu、CANN 和可见设备")
     if name != "auto":
         return torch.device(name)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
     return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
 
@@ -260,12 +274,14 @@ def step_optimizers(optimizers: list[torch.optim.Optimizer]) -> None:
 
 
 def rng_state() -> dict:
-    """Save sampling/dropout state without initializing CUDA in a CPU process."""
+    """保存采样状态，只读取已经初始化的加速器。"""
     import random
     import numpy as np
     result = dict(torch=torch.get_rng_state(), python=random.getstate(), numpy=np.random.get_state())
     if torch.cuda.is_initialized():
         result['cuda'] = torch.cuda.get_rng_state_all()
+    if hasattr(torch, "npu") and torch.npu.is_initialized():
+        result["npu"] = torch.npu.get_rng_state()
     return result
 
 
@@ -279,6 +295,8 @@ def restore_rng(state: dict | None) -> None:
     np.random.set_state(state['numpy'])
     if 'cuda' in state:
         torch.cuda.set_rng_state_all(state['cuda'])
+    if "npu" in state and hasattr(torch, "npu") and torch.npu.is_initialized():
+        torch.npu.set_rng_state(state["npu"])
 
 
 # ---------- 运行目录：一次完整训练的各个阶段都放在同一个目录下（默认 out/small），每个阶段写到 <运行目录>/<阶段>/ckpt.pt，

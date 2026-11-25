@@ -23,8 +23,8 @@ DEFAULT_TOP_K = 50
 
 
 def sampling_generator(device: torch.device, seed: int) -> torch.Generator | None:
-    """CPU、CUDA 都使用对应设备的随机数生成器，让固定种子的评测可复现。"""
-    return torch.Generator(device=device).manual_seed(seed) if device.type in ("cpu", "cuda") else None
+    """CPU、CUDA 和 NPU 使用对应设备的随机数生成器，让固定种子的评测可复现。"""
+    return torch.Generator(device=device).manual_seed(seed) if device.type in ("cpu", "cuda", "npu") else None
 
 
 def prompt_ids(tok: Tokenizer, prompt: str) -> list[int]:
