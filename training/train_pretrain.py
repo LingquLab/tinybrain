@@ -184,7 +184,7 @@ def tokens_for(spec: str) -> str:
 
 def train(args) -> dict:
     """跑完训练，返回 {"step", "loss", "val_loss", "tokens"}。用 torchrun 启动时是多卡（ZeRO-1，见 training/distributed.py）。"""
-    zero, device = init_distributed(args.device)
+    zero, device = init_distributed(args.device, tilexr=getattr(args, "tilexr", False))
     try:
         return run_training(args, zero, device)
     finally:
@@ -385,7 +385,8 @@ def parse_args(argv=None):
     g.add_argument("--resume", action="store_true", help="从输出目录里的存档接着跑")
 
     g = p.add_argument_group("硬件")
-    g.add_argument("--device", default="auto", help="auto、cuda、mps 或 cpu")
+    g.add_argument("--device", default="auto", help="auto、cuda、npu、mps 或 cpu")
+    g.add_argument("--tilexr", action="store_true", help="在单机多 NPU 训练中用 TileXR 执行 AllReduce 和 Broadcast")
     g.add_argument("--no-compile", action="store_true", help="CUDA 上也不用 torch.compile")
     g.add_argument('--no-checkpoint', action='store_true', help='Disable activation recomputation when GPU memory permits')
     g.add_argument("--cuda-graph", action="store_true", help="捕获融合 Adam 和 Muon 更新图；只支持 CUDA 普通前馈模型、自定义 Muon")

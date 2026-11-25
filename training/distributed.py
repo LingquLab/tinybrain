@@ -14,9 +14,11 @@ ZeRO-1：每个参数归一张卡管（从大到小贪心地分，各卡管的�
   5. 更新好的参数从管它的卡广播给所有卡。
 通信量和普通的数据并行一样多（汇总一次、广播一次）。存档时把各卡的优化器状态合成一份，格式和单卡存的完全一样。
 MoE 的路由偏置按各卡记下的负载的平均来调，各卡的偏置始终一样。
+昇腾多卡用 HCCL 归约梯度；--tilexr 让单机的 AllReduce 和 Broadcast 走 TileXR。
 """
 import os
 from datetime import timedelta
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -72,6 +74,7 @@ class Zero:
     def __init__(self, rank: int = 0, world: int = 1, device: torch.device | None = None, cpu_group=None):
         self.rank, self.world, self.device, self.cpu_group = rank, world, device, cpu_group
         self.params, self.owners = [], {}
+        self.tilexr = None
 
     @property
     def enabled(self) -> bool:
@@ -82,8 +85,20 @@ class Zero:
         return self.rank == 0
 
     def close(self) -> None:
-        if self.enabled and dist.is_initialized():
-            dist.destroy_process_group()
+        try:
+            if self.tilexr is not None:
+                self.tilexr.close()
+        finally:
+            if self.enabled and dist.is_initialized():
+                dist.destroy_process_group()
+
+    def all_reduce(self, tensor: torch.Tensor) -> None:
+        if self.tilexr is None or self.tilexr.all_reduce(tensor) is None:
+            dist.all_reduce(tensor)
+
+    def broadcast(self, tensor: torch.Tensor, src: int) -> None:
+        if self.tilexr is None or self.tilexr.broadcast(tensor, src) is None:
+            dist.broadcast(tensor, src=src)
 
     def main_first(self, fn):
         """先让 0 号卡做（比如第一次切词，可能要几个小时），别的卡等它做完再做（这时直接用它做好的）。"""
@@ -100,7 +115,7 @@ class Zero:
         if self.enabled:
             with torch.no_grad():
                 for t in list(model.parameters()) + list(model.buffers()):
-                    dist.broadcast(t.data, src=0)
+                    self.broadcast(t.data, src=0)
 
     def owns(self, p: torch.Tensor) -> bool:
         return self.owners.get(id(p), 0) == self.rank
@@ -114,14 +129,16 @@ class Zero:
         if not self.enabled:
             return t
         t = t.detach().clone()
-        dist.all_reduce(t)
+        self.all_reduce(t)
         return t / self.world
 
     def sum_floats(self, *values: float) -> list[float]:
         if not self.enabled:
             return list(values)
-        t = torch.tensor(values, dtype=torch.float64, device=self.device)
-        dist.all_reduce(t)
+        # NPU 上用 CPU 组汇总验证指标，保留 Python float 的双精度。
+        on_npu = self.device.type == "npu"
+        t = torch.tensor(values, dtype=torch.float64, device="cpu" if on_npu else self.device)
+        dist.all_reduce(t, group=self.cpu_group if on_npu else None)
         return t.tolist()
 
     @torch.no_grad()
@@ -129,7 +146,7 @@ class Zero:
         """每个参数的梯度求平均，只送到管它的卡上；别的卡上这个参数的梯度清掉（用不上了）。
         某张卡上没有梯度的参数（比如这批数据一个词都没选中的专家）当 0 参与平均；所有卡上都没有的，平均完仍然没有，优化器照旧跳过它。"""
         used = torch.tensor([p.grad is not None for p in self.params], dtype=torch.int32, device=self.device)
-        dist.all_reduce(used)
+        self.all_reduce(used)
         for p in self.params:
             if p.grad is None:
                 p.grad = torch.zeros_like(p)
@@ -155,7 +172,7 @@ class Zero:
         square = torch.zeros((), dtype=torch.float32, device=self.device)
         if grads:
             square = torch.stack([g.float().pow(2).sum() for g in grads]).sum()
-        dist.all_reduce(square)
+        self.all_reduce(square)
         norm = square.sqrt()
         scale = (max_norm / (norm + 1e-6)).clamp(max=1.0)
         if grads:
@@ -169,7 +186,7 @@ class Zero:
         if not layers:
             return
         loads = torch.stack([m.pending_load for m in layers])
-        dist.all_reduce(loads)
+        self.all_reduce(loads)
         loads /= self.world
         for m, load in zip(layers, loads):
             m.pending_load = load
@@ -184,7 +201,7 @@ class Zero:
                     flat = _flatten_dense_tensors([p.data for p in bucket])
                 else:
                     flat = torch.empty(sum(p.numel() for p in bucket), dtype=bucket[0].dtype, device=bucket[0].device)
-                dist.broadcast(flat, src=owner)
+                self.broadcast(flat, src=owner)
                 if owner != self.rank:
                     for p, f in zip(bucket, _unflatten_dense_tensors(flat, bucket)):
                         p.data.copy_(f)
@@ -208,19 +225,36 @@ class Zero:
         return merged
 
 
-def init_distributed(device_name: str = "auto") -> tuple[Zero, torch.device]:
-    """torchrun 启动时（环境变量里 WORLD_SIZE 大于 1）建好进程组：CUDA 用 NCCL，每个进程一张卡；CPU 用 gloo（测试用）。否则就是单卡。"""
+def init_distributed(device_name: str = "auto", *, tilexr: bool = False) -> tuple[Zero, torch.device]:
+    """按 LOCAL_RANK 绑定设备。NPU 用 HCCL，可选 TileXR 接管单机的 AllReduce 和 Broadcast。"""
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world == 1:
+        if tilexr:
+            raise ValueError("--tilexr 需要 torchrun 在同一台服务器启动多个 NPU 进程")
         return Zero(), pick_device(device_name)
     rank, local = int(os.environ["RANK"]), int(os.environ.get("LOCAL_RANK", "0"))
-    if device_name.startswith("cuda") or (device_name == "auto" and torch.cuda.is_available()):
-        device, backend = torch.device("cuda", local), "nccl"
-        torch.cuda.set_device(device)
-    elif device_name in ("auto", "cpu"):
+    kind = pick_device(device_name.split(":")[0]).type
+    if tilexr and (kind != "npu" or int(os.environ.get("LOCAL_WORLD_SIZE", "0")) != world or world > 8):
+        raise ValueError("--tilexr 支持单机 2 到 8 个 NPU 进程")
+    if kind in ("cuda", "npu"):
+        device = torch.device(kind, local)
+        getattr(torch, kind).set_device(device)
+        backend = "hccl" if kind == "npu" else "nccl"
+    elif kind == "cpu" or device_name == "auto":
         device, backend = torch.device("cpu"), "gloo"
     else:
-        raise ValueError(f"多卡训练只支持 CUDA（NCCL）和 CPU（gloo），不支持 {device_name}")
+        raise ValueError(f"多卡训练支持 CUDA、NPU 和 CPU，不支持 {device_name}")
     dist.init_process_group(backend, timeout=timedelta(minutes=30))
-    cpu_group = dist.new_group(backend="gloo") if backend == "nccl" else None
-    return Zero(rank, world, device, cpu_group), device
+    zero = Zero(rank, world, device)
+    try:
+        if backend != "gloo":
+            zero.cpu_group = dist.new_group(backend="gloo")
+        if tilexr:
+            from tilexr_collectives.group_binding import bind_group
+
+            group = SimpleNamespace(cpu_group=zero.cpu_group, device=local)
+            zero.tilexr = bind_group(group, os.environ.get("TILEXR_INSTALL_PREFIX"))
+        return zero, device
+    except Exception:
+        zero.close()
+        raise
