@@ -41,14 +41,33 @@ def autocast(device: torch.device):
     return contextlib.nullcontext()
 
 
+def compile_blocks(model: LanguageModel, *, options=None):
+    """逐层捕获训练；CPU 正确性测试和 CUDA 训练走同一个入口。"""
+    from lm.checkpointing import block_body, checkpoint_block
+
+    settings = dict(fullgraph=True, dynamic=False, options=options)
+    for module in (model.memory, model.entry, model.exit):
+        if module is not None:
+            module.compile(**settings)
+    model.hyper.mappings = torch.compile(model.hyper.mappings, **settings)
+    if model.cfg.moe_packed or model.cfg.doc_eos >= 0:
+        model.compiled_block = torch.compile(block_body, **settings)
+    else:
+        # 普通稠密模型沿用原来的 checkpoint 编译策略。
+        model.checkpoint_block = torch.compile(checkpoint_block, dynamic=False, options=options)
+    return model
+
+
 def compile_model(model: torch.nn.Module, device: torch.device, enabled: bool = True, seq_len: int | None = None,
                   autotune: bool = False, attention_backend: str = "flex") -> torch.nn.Module:
-    """CUDA 上编译前向；激活重计算时逐层编译，保留层间的释放边界。MoE 不编译。"""
+    """CUDA 上编译训练前向；三维专家始终逐层编译，保留层间的释放边界。"""
     if attention_backend not in ("flex", "cudnn"):
         raise ValueError(f"未知注意力后端：{attention_backend}")
     if attention_backend == "cudnn":
         if device.type != "cuda":
             raise ValueError("cuDNN 注意力要求 CUDA")
+        if model.cfg.doc_eos >= 0 or model.cfg.attn_sink:
+            raise ValueError("cuDNN 注意力不支持 doc_eos 或 attn_sink，请选 --attention-backend flex")
         from lm.layers.attention import prepare_cudnn_attention
         prepare_cudnn_attention()
     if device.type == "cuda":
@@ -57,20 +76,17 @@ def compile_model(model: torch.nn.Module, device: torch.device, enabled: bool = 
             raise RuntimeError("CUDA 加速需要 liger-kernel>=0.8.5；Linux 安装 .[cuda]，Windows 配好 triton-windows 后用 --no-deps 安装 liger-kernel。")
         for block in model.blocks:
             block.attn.backend = attention_backend
-            block.attn.prepare(seq_len or block.attn._flex_length or model.cfg.max_seq_len, device)
-    if not enabled or device.type != "cuda" or getattr(getattr(model, "cfg", None), "moe_experts", 0):
+            if model.cfg.doc_eos < 0 and block.attn.head_dim >= 16:
+                block.attn.prepare(seq_len or block.attn._flex_length or model.cfg.max_seq_len, device)
+    if not enabled or device.type != "cuda":
+        return model
+    if model.cfg.moe_experts and not model.cfg.moe_packed:
         return model
     options = {"triton.cudagraphs": False, "max_autotune": autotune}
-    if getattr(model, "gradient_checkpointing", False):
-        # 整图 AOT 反向会把多层 mHC 的布局转换、重算结果同时保留。
-        # checkpoint 放在编译区域外，让每层反向结束后即可释放临时激活。
-        from lm.checkpointing import checkpoint_block
-        for module in (model.memory, model.entry, model.exit):
-            if module is not None:
-                module.compile(fullgraph=True, dynamic=False, options=options)
-        model.hyper.mappings = torch.compile(model.hyper.mappings, fullgraph=True, dynamic=False, options=options)
-        model.checkpoint_block = torch.compile(checkpoint_block, dynamic=False, options=options)
-        return model
+    if model.cfg.moe_packed:
+        options["emulate_precision_casts"] = True
+    if model.cfg.moe_packed or model.gradient_checkpointing or model.cfg.doc_eos >= 0:
+        return compile_blocks(model, options=options)
     return torch.compile(model, dynamic=False, options=options)
 
 

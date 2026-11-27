@@ -26,14 +26,14 @@ class Block(nn.Module):
         else:
             self.ffn = FeedForward(cfg.dim, int(cfg.ffn_mult * cfg.dim))
 
-    def forward(self, x, cos, sin, maps, memory=None, cache: LayerCache | None = None, return_counts=False, docs=None):
+    def forward(self, x, cos, sin, maps, memory=None, cache: LayerCache | None = None, return_counts=False, docs=None, mask=None):
         """maps 可传全模型的系数，或只传这一层的两组系数。return_counts 时额外返回本层的命中数。
         docs 是 DocMask（每个位置属于哪篇文档），只在开了 doc_eos 时传。"""
         pre, post, res = maps
         a, f = (0, 1) if pre.size(0) == 2 else (2 * self.index, 2 * self.index + 1)
         if self.engram is not None:
             x = self.engram(x, memory)
-        x = write_streams(x, self.attn(read_normalized_streams(x, pre[a], self.attn_norm), cos, sin, cache, docs), res[a], post[a])
+        x = write_streams(x, self.attn(read_normalized_streams(x, pre[a], self.attn_norm), cos, sin, cache, docs, mask), res[a], post[a])
         value = read_normalized_streams(x, pre[f], self.ffn_norm)
         counts = None
         if isinstance(self.ffn, MoE):

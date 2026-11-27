@@ -42,6 +42,7 @@ class LanguageModel(nn.Module):
         self.gradient_checkpointing = False
         self.checkpoint_policy = "full"
         self.checkpoint_block = checkpoint_block
+        self.compiled_block = None
         self.embed = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.embed_norm = RMSNorm(cfg.dim)
         self.memory = None
@@ -112,12 +113,22 @@ class LanguageModel(nn.Module):
 
         maps = self.hyper.mappings(x.dtype)
         balance = x.new_zeros((), dtype=torch.float32)
+        training_pass = self.training and torch.is_grad_enabled() and state is None
+        masks = {}  # 只在本次前向内共享，下一批的 EOS 位置可能不同
         for i, block in enumerate(self.blocks):
             c, s = (long_cos, long_sin) if block.long else (cos, sin)
             # 带生成缓存时不能重算。MoE 的路由偏置不在前向里改（见 lm/layers/moe.py），重算时挑的专家不变，可以照常重算。
-            if self.gradient_checkpointing and self.training and torch.is_grad_enabled() and state is None:
+            if training_pass and (self.gradient_checkpointing or self.compiled_block is not None):
                 layer_maps = tuple(m[2 * i:2 * i + 2] for m in maps)
-                x, b = self.checkpoint_block(block, x, c, s, layer_maps, memory, self.checkpoint_policy, docs)
+                policy = self.checkpoint_policy if self.gradient_checkpointing else "off"
+                mask, layer_docs = None, docs
+                if self.compiled_block is not None:
+                    key = (block.attn.backend, block.attn.window)
+                    if key not in masks:
+                        masks[key] = block.attn.training_mask(T, idx.device, docs)
+                    mask, layer_docs = masks[key], None
+                x, b = self.checkpoint_block(block, x, c, s, layer_maps, memory, policy, layer_docs,
+                                             mask=mask, run=self.compiled_block)
             else:
                 x, b = block(x, c, s, maps, memory, state.layers[i] if state is not None else None, docs=docs)
             balance = balance + b.float()

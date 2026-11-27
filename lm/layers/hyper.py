@@ -10,10 +10,10 @@ import torch
 import torch.nn as nn
 
 try:
-    from liger_kernel.ops.mhc import LigerMHCPreFunction, LigerMHCPostResFunction
-    from liger_kernel.ops.mhc import mhc_pre_fwd, mhc_pre_bwd, mhc_post_res_fwd, mhc_post_res_bwd
+    from liger_kernel.ops.mhc import LigerMHCPreFunction, mhc_pre_fwd, mhc_pre_bwd
+    from training.mhc import write_mhc
 except ImportError:
-    LigerMHCPreFunction = LigerMHCPostResFunction = None
+    LigerMHCPreFunction = write_mhc = None
 
 
 class _MHCPre(torch.autograd.Function):
@@ -34,31 +34,6 @@ class _MHCPre(torch.autograd.Function):
         grad = grad.contiguous().view(-1, x.size(2))
         dx, dp = mhc_pre_bwd(x, pre, grad, out_grad_x=torch.empty_like(x))
         return dx.view(ctx.shape), dp.view(*ctx.shape[:-1])
-
-
-class _MHCPost(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, out, post, res):
-        ctx.shape = x.shape
-        x = x.contiguous().view(-1, *x.shape[-2:])
-        n, streams, width = x.shape
-        out = out.contiguous().view(n, width)
-        post = post.reshape(n, streams).float().contiguous()
-        res = res.reshape(n, streams, streams).float().contiguous()
-        meta = dict(block_n=32, block_c=128, num_warps=4, num_stages=2) if width >= 512 else {}
-        result = mhc_post_res_fwd(x, out, post, res, out=torch.empty_like(x), **meta)
-        ctx.save_for_backward(x, out, post, res)
-        return result.view(ctx.shape)
-
-    @staticmethod
-    def backward(ctx, grad):
-        x, out, post, res = ctx.saved_tensors
-        grad = grad.contiguous().view_as(x)
-        meta = dict(block_n=32, block_c=128, num_warps=4, num_stages=2) if x.size(2) >= 512 else {}
-        dx, df, dp, dr = mhc_post_res_bwd(x, out, post, res, grad,
-                                        out_grad_x=torch.empty_like(x), out_grad_f=torch.empty_like(out), **meta)
-        outer = ctx.shape[:-2]
-        return dx.view(ctx.shape), df.view(*outer, x.size(2)), dp.view(*outer, x.size(1)), dr.view(*outer, x.size(1), x.size(1))
 
 
 def sinkhorn(logits: torch.Tensor, iters: int) -> torch.Tensor:
@@ -111,10 +86,10 @@ def read_normalized_streams(x, pre, norm):
 
 def write_streams(x: torch.Tensor, out: torch.Tensor, res: torch.Tensor, post: torch.Tensor) -> torch.Tensor:
     """x: (B, T, n, d)，out: (B, T, d)，res: (n, n)，post: (n) → (B, T, n, d)"""
-    if LigerMHCPostResFunction is not None and x.is_cuda and x.dtype != torch.float64:
+    if write_mhc is not None and x.is_cuda and x.dtype != torch.float64:
         dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
         if out.dtype == post.dtype == dtype:
             n = x.size(-2)
-            return _MHCPost.apply(
+            return write_mhc(
                 x.to(dtype), out, post.expand(*x.shape[:-2], n), res.expand(*x.shape[:-2], n, n))
     return torch.einsum("mn,btnd->btmd", res, x) + post[:, None] * out[:, :, None, :]

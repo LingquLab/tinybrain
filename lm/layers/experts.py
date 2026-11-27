@@ -1,6 +1,8 @@
 """把 top-k 个槽按专家排序，算完后按原槽顺序加权求和。"""
 import torch
 
+from training.segments import linear
+
 from .feedforward import relu_square
 
 
@@ -27,12 +29,11 @@ def dispatch(z, chosen, gates, w_in, w_out, cap):
     ids = chosen.flatten()
     order = ids.argsort(stable=True)
     counts = torch.zeros(len(w_in), device=z.device, dtype=torch.int32)
-    counts.scatter_add_(0, ids, torch.ones_like(ids, dtype=counts.dtype))
+    counts = counts.scatter_add(0, ids, torch.ones_like(ids, dtype=counts.dtype))
     inverse = torch.empty_like(order).scatter(0, order, torch.arange(ids.numel(), device=z.device))
     inputs = _Rows.apply(z, order // k, inverse, k)
 
-    if z.is_cuda:
-        from training.grouped import linear
+    if z.is_cuda or (torch.compiler.is_compiling() and torch.is_tensor(w_in)):
         wi = w_in if torch.is_tensor(w_in) else torch.stack(tuple(w_in))
         wo = w_out if torch.is_tensor(w_out) else torch.stack(tuple(w_out))
         ends = counts.cumsum(0, dtype=torch.int32)

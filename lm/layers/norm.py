@@ -20,6 +20,11 @@ class RMSNorm(nn.RMSNorm):
         if use_liger(x):
             eps = self.eps if self.eps is not None else torch.finfo(x.dtype).eps
             return LigerRMSNormFunction.apply(x, self.weight, eps, 0.0, "gemma", False)
+        if torch.compiler.is_compiling() and x.is_cuda and x.dtype != torch.float64 and LigerRMSNormFunction is not None:
+            # 和 eager 的 gemma 路径使用相同的 eps、FP32 归约及输出精度。
+            eps = self.eps if self.eps is not None else torch.finfo(x.dtype).eps
+            value = x.float()
+            return (value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps) * self.weight.float()).to(x.dtype)
         return super().forward(x)
 
 

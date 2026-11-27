@@ -32,10 +32,11 @@ except ImportError:
 
 def flex_with_lse(q, k, v, block_mask):
     """Flex 注意力，同时返回每个查询的 log-sum-exp（自然对数，形状 (B, H, T)）。"""
+    run = flex_attention if torch.compiler.is_compiling() else _flex_attention
     if AuxRequest is not None:
-        out, aux = _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True, return_aux=AuxRequest(lse=True))
+        out, aux = run(q, k, v, block_mask=block_mask, enable_gqa=True, return_aux=AuxRequest(lse=True))
         return out, aux.lse
-    return _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True, return_lse=True)
+    return run(q, k, v, block_mask=block_mask, enable_gqa=True, return_lse=True)
 
 _cudnn_attention = None
 _cudnn_dll_directories = []
@@ -48,8 +49,8 @@ def prepare_cudnn_attention():
         if os.name == "nt":
             _cudnn_dll_directories.append(os.add_dll_directory(str(Path(torch.__file__).parent / "lib")))
         try:
-            import cudnn
-            _cudnn_attention = cudnn.sdpa_torch
+            from cudnn import sdpa_torch
+            _cudnn_attention = sdpa_torch
         except ImportError as exc:
             raise RuntimeError("cuDNN 窗口注意力需要 nvidia-cudnn-frontend>=1.32.3；安装 .[cudnn]。") from exc
 
@@ -90,12 +91,11 @@ class DocMask:
     def flex(self, window: int | None, length: int, device):
         if window not in self._flex:
             doc = self.doc
-            if window is None:
-                def mask(b, h, q, k):
-                    return (q >= k) & (doc[b, q] == doc[b, k])
-            else:
-                def mask(b, h, q, k):
-                    return (q >= k) & (q - k < window) & (doc[b, q] == doc[b, k])
+            def mask(b, h, q, k):
+                # 尾块可含填充坐标，先约束读地址，再排除越界位置。
+                same = doc[b, q.clamp_max(length - 1)] == doc[b, k.clamp_max(length - 1)]
+                visible = same & (q < length) & (k < length) & (q >= k)
+                return visible if window is None else visible & (q - k < window)
             self._flex[window] = create_block_mask(mask, doc.size(0), None, length, length, device=str(device))
         return self._flex[window]
 
@@ -158,7 +158,18 @@ class Attention(nn.Module):
             mask = mask & (pos[:, None] - pos[None, :] < self.window)
         return mask & docs.same() if docs is not None else mask
 
-    def attend(self, q, k, v, docs: DocMask | None = None):
+    def training_mask(self, length, device, docs):
+        """在层的编译区外准备本批次要传入的 BlockMask 或布尔张量。"""
+        if device.type == "cuda" and self.backend == "cudnn":
+            return None
+        if device.type == "cuda" and self.backend == "flex" and self.head_dim >= 16:
+            if docs is not None:
+                return docs.flex(self.window, length, device)
+            self.prepare(length, device)
+            return self._flex_mask
+        return self.dense_mask(length, device, docs)
+
+    def attend(self, q, k, v, docs: DocMask | None = None, mask=None):
         length = q.size(-2)
         if q.is_cuda and self.backend == "cudnn":
             if docs is not None or self.sink is not None:
@@ -169,16 +180,13 @@ class Attention(nn.Module):
                                     window_left=self.window if self.window is not None else -1,
                                     return_lse=True)[0]
         if q.is_cuda and self.backend == 'flex' and q.size(-1) >= 16:
-            if docs is not None:
-                block_mask = docs.flex(self.window, length, q.device)
-            else:
-                if self._flex_length != length or self._flex_mask is None:
-                    self.prepare(length, q.device)
-                block_mask = self._flex_mask
+            block_mask = self.training_mask(length, q.device, docs) if mask is None else mask
             if self.sink is not None:
                 return self.with_sink(*flex_with_lse(q, k, v, block_mask))
-            return _flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-        mask = self.dense_mask(length, q.device, docs)
+            run = flex_attention if torch.compiler.is_compiling() else _flex_attention
+            return run(q, k, v, block_mask=block_mask, enable_gqa=True)
+        if mask is None:
+            mask = self.dense_mask(length, q.device, docs)
         if self.sink is not None:
             return self.with_sink(*reference_attention(q, k, v, attn_mask=mask, is_causal=mask is None))
         if mask is None:
@@ -186,7 +194,7 @@ class Attention(nn.Module):
         return grouped_attention(q, k, v, attn_mask=mask)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, cache: LayerCache | None = None,
-                docs: DocMask | None = None) -> torch.Tensor:
+                docs: DocMask | None = None, mask=None) -> torch.Tensor:
         B, T, _ = x.shape
         if self.fuse_qkv and self.training and x.is_cuda and cache is None:
             q_size, kv_size = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
@@ -207,7 +215,7 @@ class Attention(nn.Module):
                 k, v = k[:, :, -self.window:], v[:, :, -self.window:]
             out = self.with_sink(*reference_attention(q, k, v)) if self.sink is not None else grouped_attention(q, k, v)
         else:
-            out = self.attend(q, k, v, docs)
+            out = self.attend(q, k, v, docs, mask)
         if cache is not None:
             keep = slice(None) if self.window is None else slice(-self.window, None)
             cache.k, cache.v = k[:, :, keep], v[:, :, keep]

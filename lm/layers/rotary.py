@@ -26,7 +26,8 @@ def apply_rotary_qk(q, k, cos, sin):
     # With T=1 the transposed contiguous tensor can have a singleton stride
     # smaller than a batch row. Liger uses that stride to locate the next row.
     batched_decode = q.size(0) > 1 and q.size(-2) == 1
-    if q.is_cuda and q.dtype != torch.float64 and LigerRopeFunction is not None and not batched_decode:
+    if (q.is_cuda and q.dtype != torch.float64 and LigerRopeFunction is not None
+            and not batched_decode and not torch.compiler.is_compiling()):
         # 本项目用负角度约定；Liger 的 Llama 约定取相反的 sin。
         return LigerRopeFunction.apply(q, k, cos.to(q.dtype), -sin.to(q.dtype), None, 1, q.size(-1))
     return apply_rotary(q, cos, sin), apply_rotary(k, cos, sin)

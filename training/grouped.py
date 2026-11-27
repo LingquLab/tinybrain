@@ -3,6 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .segments import linear  # 保留 training.grouped.linear 入口
+
 
 @triton.jit
 def _project(X, W, Ends, Y, D: tl.constexpr, H: tl.constexpr, E: tl.constexpr,
@@ -44,8 +46,7 @@ def _weight(G, X, Ends, DW, H: tl.constexpr, D: tl.constexpr):
     tl.store(DW + (e * H + h[:, None]) * D + d[None, :], acc, (h[:, None] < H) & (d[None, :] < D))
 
 
-@torch.library.custom_op("tinybrain::expert_linear", mutates_args=())
-def _linear(x: torch.Tensor, w: torch.Tensor, ends: torch.Tensor) -> torch.Tensor:
+def project(x: torch.Tensor, w: torch.Tensor, ends: torch.Tensor) -> torch.Tensor:
     rows, d = x.shape
     e, h, _ = w.shape
     y = x.new_empty((rows, h))
@@ -54,47 +55,9 @@ def _linear(x: torch.Tensor, w: torch.Tensor, ends: torch.Tensor) -> torch.Tenso
     return y
 
 
-@_linear.register_fake
-def _(x, w, ends):
-    return x.new_empty((x.size(0), w.size(1)))
-
-
-@torch.library.custom_op("tinybrain::expert_dw", mutates_args=())
-def _dw(g: torch.Tensor, x: torch.Tensor, ends: torch.Tensor) -> torch.Tensor:
+def weight_grad(g: torch.Tensor, x: torch.Tensor, ends: torch.Tensor) -> torch.Tensor:
     h, d = g.size(1), x.size(1)
     dw = x.new_empty((ends.numel(), h, d))
     _weight[(triton.cdiv(h, 64), triton.cdiv(d, 64), ends.numel())](
         g.contiguous(), x.contiguous(), ends, dw, h, d, num_warps=4, num_stages=2)
     return dw
-
-
-@_dw.register_fake
-def _(g, x, ends):
-    return x.new_empty((ends.numel(), g.size(1), x.size(1)))
-
-
-def _save(ctx, inputs, output):
-    ctx.save_for_backward(*inputs)
-
-
-def _backward(ctx, grad):
-    x, w, ends = ctx.saved_tensors
-    grad = grad.to(w.dtype)
-    return _linear(grad, w.mT, ends), _dw(grad, x, ends), None
-
-
-_linear.register_autograd(_backward, setup_context=_save)
-
-
-def linear(x, w, ends):
-    if x.dtype == torch.float64:
-        # tl.dot 不支持双精度。诊断时用设备上的掩码选行，避免读回边界。
-        rows = torch.arange(x.size(0), device=x.device, dtype=ends.dtype)
-        owner = torch.searchsorted(ends, rows, right=True)
-        y = x.new_zeros((x.size(0), w.size(1)))
-        for i, weight in enumerate(w.unbind()):
-            y = torch.where((owner == i)[:, None], x @ weight.T, y)
-        return y
-    # square 在 CUDA 自动混合精度下可返回 FP32，两次投影都在这里恢复 GEMM 精度。
-    dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else x.dtype
-    return _linear(x.to(dtype), w.to(dtype), ends)

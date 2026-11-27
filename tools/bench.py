@@ -11,7 +11,9 @@ import time
 import torch
 
 from lm import PRESETS, LanguageModel, preset
+from lm.checkpointing import checkpoint_block
 
+from training.train_pretrain import parse_overrides
 from training.trainer_utils import autocast, build_optimizers, compile_model, peak_memory_gb, pick_device, setup_device
 
 
@@ -22,6 +24,7 @@ def main(argv=None):
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--grad-accum", type=int, default=1, help="每个完整更新包含几个微批")
     parser.add_argument("--seq", type=int, default=2048)
+    parser.add_argument("--set", nargs="*", default=[], metavar="字段=值", help="模型配置覆盖，与 pretrain 相同")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3, help="前几步不计时（编译、缓存预热）")
     parser.add_argument("--device", default="auto")
@@ -47,7 +50,8 @@ def main(argv=None):
         if device.type != "cuda" or not 0 < args.gpu_memory_fraction <= 1:
             parser.error("--gpu-memory-fraction 要求 CUDA，且必须在 0 与 1 之间")
         torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction, device.index)
-    cfg = preset(args.preset, args.vocab, max_seq_len=max(args.seq, 1024))
+    changes = {"max_seq_len": max(args.seq, 1024), **parse_overrides(args.set)}
+    cfg = preset(args.preset, args.vocab, **changes)
     model = LanguageModel(cfg).to(device)
     model.gradient_checkpointing = device.type == "cuda" and not args.no_checkpoint and not args.generate
     model.checkpoint_policy = args.checkpoint_policy
@@ -64,8 +68,9 @@ def main(argv=None):
         from training.cuda_graph import OptimizerGraph
         graph_step = OptimizerGraph(optimizers)
     name = f"{torch.cuda.get_device_name(device)}，" if device.type == "cuda" else ""
+    compiled = step_fn is not model or model.compiled_block is not None or model.checkpoint_block is not checkpoint_block
     print(f"设备 {device}，{name}PyTorch {torch.__version__}，{args.preset}，优化器 {args.optimizer}，参数 {model.param_report()['合计'] / 1e6:.1f}M，"
-          f"微批 {args.batch} × 长 {args.seq}，累积 {args.grad_accum}，{'已编译' if step_fn is not model else '没编译'}")
+          f"微批 {args.batch} × 长 {args.seq}，累积 {args.grad_accum}，{'已编译' if compiled else '没编译'}")
     attention = {"flex": "FlexAttention", "cudnn": "cuDNN"}[args.attention_backend] if device.type == "cuda" else "SDPA"
     print(f"激活重计算：{args.checkpoint_policy if model.gradient_checkpointing else '关'}；输出层：{'完整 logits' if args.full_logits else '融合交叉熵'}；注意力：{attention}")
 
