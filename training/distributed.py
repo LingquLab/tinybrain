@@ -22,6 +22,8 @@ import torch
 import torch.distributed as dist
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from lm.layers.moe import MoE
+
 from .trainer_utils import pick_device
 
 BUCKET = 32 * 2**20  # 一次通信最多多少个数（32M 个 float32 是 128 MB）
@@ -164,15 +166,14 @@ class Zero:
 
     @torch.no_grad()
     def sync_balance(self, model: torch.nn.Module) -> None:
-        """MoE：各卡记下的专家负载取平均，各卡按同一份负载调路由偏置，偏置才不会各走各的。"""
-        layers = [m for m in model.modules() if getattr(m, "pending_load", None) is not None]
+        """先跨卡求整步命中数之和；各卡 token 数不等时也使用同一个分母。"""
+        layers = [m for m in model.modules() if isinstance(m, MoE)]
         if not layers:
             return
-        loads = torch.stack([m.pending_load for m in layers])
-        dist.all_reduce(loads)
-        loads /= self.world
-        for m, load in zip(layers, loads):
-            m.pending_load = load
+        counts = torch.cat([m.pending_load for m in layers])
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        for m, part in zip(layers, counts.split([m.n_experts for m in layers])):
+            m.pending_load.copy_(part)
 
     @torch.no_grad()
     def broadcast_parameters(self) -> None:

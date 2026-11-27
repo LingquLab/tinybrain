@@ -8,19 +8,27 @@ except ImportError:
     LigerReLUSquaredFunction = None
 
 
+def relu_square(x, cap):
+    x = F.relu(x)
+    if cap:
+        x = x.clamp_max(cap)
+    return x.square()
+
+
 class FeedForward(nn.Module):
     """前馈层，激活函数是 ReLU 的平方。输出投影从零开始，所以刚初始化时这一层什么都不加。"""
 
-    def __init__(self, dim: int, hidden: int):
+    def __init__(self, dim: int, hidden: int, cap: float = 0.0):
         super().__init__()
+        self.cap = cap
         self.fc = nn.Linear(dim, hidden, bias=False)
         self.proj = nn.Linear(hidden, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden = self.fc(x)
-        if torch.compiler.is_compiling():
+        if self.cap or torch.compiler.is_compiling():
             # 让 Inductor 联合搜索 GEMM 与激活的融合实现，包括反向 epilogue。
-            hidden = F.relu(hidden).square()
+            hidden = relu_square(hidden, self.cap)
         elif hidden.is_cuda and LigerReLUSquaredFunction is not None:
             hidden = LigerReLUSquaredFunction.apply(hidden)
         else:

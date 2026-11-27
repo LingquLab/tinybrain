@@ -27,6 +27,7 @@ class Muon(torch.optim.Optimizer):
         """momentum_dtype：动量用什么精度存，默认和梯度一样；显存紧时用 torch.bfloat16，省一半。"""
         super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay))
         self.momentum_dtype = momentum_dtype
+        self.expert_counts = {}  # 参数 -> 当前优化器步的全局路由计数，不写入存档
         for group in self.param_groups:
             if any(p.ndim < 2 for p in group["params"]):
                 raise ValueError("Muon 只能用于二维以上的参数")
@@ -37,6 +38,51 @@ class Muon(torch.optim.Optimizer):
             state["momentum_buffer"] = torch.zeros_like(p.grad, dtype=self.momentum_dtype or p.grad.dtype)
         return state["momentum_buffer"]
 
+    @staticmethod
+    def _direction(grad, momentum, group):
+        update = grad.lerp(momentum, group["momentum"]) if group["nesterov"] else momentum
+        work = update.bfloat16() if update.is_cuda else update
+        return orthogonalize(work, group["ns_steps"]).to(grad.dtype)
+
+    @staticmethod
+    def _apply(p, update, group):
+        lr = group["lr"]
+        scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
+        if group["weight_decay"]:
+            p.mul_(1 - lr * group["weight_decay"])
+        if isinstance(lr, torch.Tensor):
+            p.add_(update * (-lr * scale))
+        else:
+            p.add_(update, alpha=-lr * scale)
+
+    def _step_bank(self, p, group):
+        buf = self._momentum(p)
+        counts = self.expert_counts.get(p)
+        # 每次处理若干专家；归一化和 NS 始终只看最后两维。
+        chunk = max(1, 2**22 // p[0].numel())
+        for i in range(0, p.size(0), chunk):
+            sl = slice(i, i + chunk)
+            w, g, v = p[sl], p.grad[sl], buf[sl]
+            new = v.lerp(g.to(v.dtype), 1 - group["momentum"])
+            active = None if counts is None else (counts[sl] > 0)[:, None, None]
+            v.copy_(new if active is None else torch.where(active, new, v))
+            update = self._direction(g, v.to(g.dtype), group)
+            if active is None:
+                self._apply(w, update, group)
+            else:
+                # 零梯度不等于未命中：空专家的动量、权重衰减都必须跳过。
+                candidate = w.clone()
+                self._apply(candidate, update, group)
+                w.copy_(torch.where(active, candidate, w))
+
+    def _step_list(self, params, group):
+        bufs = [self._momentum(p) for p in params]
+        torch._foreach_lerp_(bufs, [p.grad.to(bufs[0].dtype) for p in params], 1 - group["momentum"])
+        grads = torch.stack([p.grad for p in params])
+        update = self._direction(grads, torch.stack(bufs).to(grads.dtype), group)
+        for p, u in zip(params, update):
+            self._apply(p, u, group)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -46,25 +92,16 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             buckets = {}
             for p in group["params"]:
-                if p.grad is not None:
+                if p.grad is None:
+                    continue
+                if p.ndim == 3:
+                    self._step_bank(p, group)
+                else:
                     buckets.setdefault(p.shape, []).append(p)
-            for shape, params in buckets.items():
-                bufs = [self._momentum(p) for p in params]
-                torch._foreach_lerp_(bufs, [p.grad.to(bufs[0].dtype) for p in params], 1 - group["momentum"])
-                grads = torch.stack([p.grad for p in params])
-                momentum = torch.stack(bufs).to(grads.dtype)
-                update = grads.lerp(momentum, group["momentum"]) if group["nesterov"] else momentum
-                half = update.is_cuda  # CUDA 上用半精度算正交化：快，而且只要方向大致对就行
-                update = orthogonalize(update.bfloat16() if half else update, group["ns_steps"]).to(grads.dtype)
-                scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
-                for p, u in zip(params, update):
-                    lr = group["lr"]
-                    if group["weight_decay"]:
-                        p.mul_(1 - lr * group["weight_decay"])
-                    if isinstance(lr, torch.Tensor):
-                        p.add_(u * (-lr * scale))
-                    else:
-                        p.add_(u, alpha=-lr * scale)
+            for params in buckets.values():
+                chunk = max(1, 2**22 // params[0].numel())
+                for i in range(0, len(params), chunk):
+                    self._step_list(params[i:i + chunk], group)
         return loss
 
     def load_state_dict(self, state_dict: dict) -> None:

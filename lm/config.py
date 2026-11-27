@@ -1,7 +1,10 @@
-"""模型配置：所有尺寸和开关都在这一个数据类里，三档预设也在这里。"""
+"""模型配置：基础尺寸和按 token 预算选择的 large 预设。"""
 import dataclasses
 import json
 from dataclasses import dataclass
+
+
+ENGRAM_SPARSE_SHARE = 0.25
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,10 @@ class ModelConfig:
     moe_balance_rate: float = 1e-3  # 负载均衡偏置每步调多少
     moe_balance_loss: float = 1e-4  # 负载均衡损失的权重
 
+    moe_packed: bool = False      # 老存档逐个保存专家；新预设使用 (专家, 输出宽, 输入宽)
+    moe_clip: float = 0.0         # MoE 内共享和路由专家的 ReLU 正半轴上限，0 关闭
+    engram_sparse_share: float = ENGRAM_SPARSE_SHARE
+
     def __post_init__(self):
         object.__setattr__(self, "engram_orders", tuple(self.engram_orders))
         object.__setattr__(self, "engram_layers", tuple(self.engram_layers) if self.engram_orders else ())
@@ -63,6 +70,8 @@ class ModelConfig:
             problems.append(f"moe_top_k={self.moe_top_k} 要在 1 和 moe_experts={self.moe_experts} 之间")
         if self.moe_experts and not 0 <= self.moe_dense_layers < self.n_layers:
             problems.append(f"moe_dense_layers={self.moe_dense_layers} 要在 0 和 n_layers={self.n_layers} 之间（至少留一层 MoE）")
+        if not 0 <= self.moe_clip < float("inf") or not 0 < self.engram_sparse_share < 1:
+            problems.append("moe_clip 应为非负有限值，engram_sparse_share 应在 (0, 1) 内")
         if problems:
             raise ValueError("模型配置有问题：" + "；".join(problems))
 
@@ -126,7 +135,7 @@ class ModelConfig:
             return self
         table = share / (1 - share) * self.inactive_expert_params()
         rows = round(table / (len(self.engram_orders) * self.engram_heads * self.engram_head_dim))
-        return dataclasses.replace(self, engram_rows=rows)
+        return dataclasses.replace(self, engram_rows=rows, engram_sparse_share=share)
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self), ensure_ascii=False, indent=1)
@@ -137,7 +146,6 @@ class ModelConfig:
 
 
 ENGRAM_SHARE = 0.45         # 普通前馈的模型：记忆表占「主干 + 记忆表」的比例
-ENGRAM_SPARSE_SHARE = 0.25  # MoE 模型：记忆表占「每个词用不到的参数」的比例（Engram 论文的最优点在 20–25%）
 
 # 三档预设，各有各的主干和记忆表。small 的主干约 64M；medium、large 的数字是我提的，还没定。
 # 记忆表：每个哈希取回的向量宽度写在这里，行数由 preset() 算出来（普通前馈按 ENGRAM_SHARE，MoE 按 ENGRAM_SPARSE_SHARE）。
@@ -150,12 +158,16 @@ PRESETS = {
                   moe_experts=48, moe_top_k=8, moe_hidden_mult=0.25, moe_shared_mult=0.5, moe_dense_layers=1),
 }
 
+# large 留给原布局的存档；预算名是语料规模，参数仍可用 --set 覆盖。
+PRESETS["large20b"] = dict(PRESETS["large"], moe_packed=True, moe_clip=10.0)
+PRESETS["large60b"] = dict(PRESETS["large20b"], moe_experts=96, engram_sparse_share=0.20)
+
 
 def preset(name: str, vocab_size: int, engram_share: float = ENGRAM_SHARE, **overrides) -> ModelConfig:
-    """按预设建配置。没有明说 engram_rows 时，记忆表的行数：普通前馈的模型按 engram_share，MoE 模型按 ENGRAM_SPARSE_SHARE。"""
+    """按预设建配置。没有明说 engram_rows 时，记忆表的行数：普通前馈的模型按 engram_share，MoE 模型按 engram_sparse_share。"""
     if name not in PRESETS:
         raise ValueError(f"没有 {name!r} 这个预设，可选：{', '.join(PRESETS)}")
     cfg = ModelConfig(vocab_size=vocab_size, **{**PRESETS[name], **overrides})
     if "engram_rows" in overrides:
         return cfg
-    return cfg.with_engram_sparse_share(ENGRAM_SPARSE_SHARE) if cfg.moe_experts else cfg.with_engram_share(engram_share)
+    return cfg.with_engram_sparse_share(cfg.engram_sparse_share) if cfg.moe_experts else cfg.with_engram_share(engram_share)

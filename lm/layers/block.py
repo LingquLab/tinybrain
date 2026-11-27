@@ -21,17 +21,24 @@ class Block(nn.Module):
         self.attn_norm, self.ffn_norm = RMSNorm(cfg.dim), RMSNorm(cfg.dim)
         if cfg.is_moe_layer(index):
             self.ffn = MoE(cfg.dim, cfg.moe_experts, cfg.moe_top_k, int(cfg.moe_hidden_mult * cfg.dim), int(cfg.moe_shared_mult * cfg.dim),
-                           cfg.moe_latent_dim, cfg.moe_balance_rate)
+                           cfg.moe_latent_dim, cfg.moe_balance_rate, cfg.moe_packed, cfg.moe_clip)
         else:
             self.ffn = FeedForward(cfg.dim, int(cfg.ffn_mult * cfg.dim))
 
-    def forward(self, x, cos, sin, maps, memory=None, cache: LayerCache | None = None):
-        """maps 可传全模型的系数，或只传这一层的两组系数。返回 (x, 均衡损失)。"""
+    def forward(self, x, cos, sin, maps, memory=None, cache: LayerCache | None = None, return_counts=False):
+        """maps 可传全模型的系数，或只传这一层的两组系数。return_counts 时额外返回本层的命中数。"""
         pre, post, res = maps
         a, f = (0, 1) if pre.size(0) == 2 else (2 * self.index, 2 * self.index + 1)
         if self.engram is not None:
             x = self.engram(x, memory)
         x = write_streams(x, self.attn(read_normalized_streams(x, pre[a], self.attn_norm), cos, sin, cache), res[a], post[a])
-        out = self.ffn(read_normalized_streams(x, pre[f], self.ffn_norm))
-        out, balance_loss = out if isinstance(out, tuple) else (out, x.new_zeros(()))
-        return write_streams(x, out, res[f], post[f]), balance_loss
+        value = read_normalized_streams(x, pre[f], self.ffn_norm)
+        counts = None
+        if isinstance(self.ffn, MoE):
+            out, balance_loss, counts = self.ffn(value, return_counts=True)
+            if not return_counts and cache is None:
+                self.ffn.record_load(counts)
+        else:
+            out, balance_loss = self.ffn(value), x.new_zeros(())
+        x = write_streams(x, out, res[f], post[f])
+        return (x, balance_loss, counts) if return_counts else (x, balance_loss)

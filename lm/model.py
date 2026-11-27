@@ -72,7 +72,7 @@ class LanguageModel(nn.Module):
                 nn.init.normal_(p, std=1.0)
             elif name == "head.weight":
                 nn.init.normal_(p, std=0.001)
-            elif leaf in ("proj", "value") or ".w_out." in name or (leaf == "up" and "ffn" in name):
+            elif leaf in ("proj", "value") or ".w_out." in name or name.endswith(".w_out") or (leaf == "up" and "ffn" in name):
                 nn.init.zeros_(p)
             elif leaf in ("pre_logit", "post_logit", "res_logit", "query"):
                 continue  # 各自的模块里已经设好了
@@ -155,7 +155,7 @@ class LanguageModel(nn.Module):
         for name, p in self.named_parameters():
             key = {"embed.weight": "词向量", "head.weight": "输出层", "memory.table.weight": "记忆表"}.get(name, "主干")
             counts[key] += p.numel()
-            if ".w_in." in name or ".w_out." in name:
+            if ".w_in." in name or ".w_out." in name or name.endswith((".w_in", ".w_out")):
                 experts += p.numel()
         counts["合计"] = sum(counts.values())
         if self.cfg.moe_experts:

@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 
 from lm import LanguageModel, ModelConfig
+from lm.layers.moe import MoE
 
 from .muon import Muon
 
@@ -200,7 +201,10 @@ def build_optimizers(model: LanguageModel, kind: str = "custom", matrix_lr: floa
     else:
         adam = torch.optim.Adam(adam_groups, betas=adam_betas, eps=adam_eps, weight_decay=0.0, fused=on_cuda)
     matrices = [dict(params=groups["matrix"], name="matrix")]
+    layers = [m for m in model.modules() if isinstance(m, MoE)]
     if kind == "native":
+        if any(m.packed for m in layers):
+            raise ValueError("三维专家用 --optimizer custom；使用原生 Muon 时请选二维布局 moe_packed=False")
         if muon_momentum_dtype is not None:
             raise ValueError("PyTorch 自带的 Muon 不能改动量的精度；要省显存用 --optimizer custom")
         if not hasattr(torch.optim, "Muon"):
@@ -209,7 +213,23 @@ def build_optimizers(model: LanguageModel, kind: str = "custom", matrix_lr: floa
                                 adjust_lr_fn="original")
     else:
         muon = Muon(matrices, lr=matrix_lr, momentum=momentum, weight_decay=weight_decay, momentum_dtype=muon_momentum_dtype)
-    if getattr(model.cfg, "moe_experts", 0):
+    legacy = []
+    for layer in layers:
+        if layer.packed:
+            muon.expert_counts[layer.w_in] = layer.pending_load
+            muon.expert_counts[layer.w_out] = layer.pending_load
+        elif on_cuda:
+            legacy.append(layer)
+    if legacy:
+        # 旧布局仍按二维参数保存。仅在更新时读一次掩码，以保留未命中参数的 grad=None 语义。
+        def skip_idle(opt, args, kwargs):
+            used = iter(torch.cat([m.pending_load for m in legacy]).ne(0).tolist())
+            for layer in legacy:
+                for a, b in zip(layer.w_in, layer.w_out):
+                    if not next(used):
+                        a.grad = b.grad = None
+        muon.register_step_pre_hook(skip_idle)
+    if layers:
         muon.register_step_post_hook(lambda optimizer, args, kwargs: model.update_balance())
     optimizers = [adam, muon]
     for opt in optimizers:
