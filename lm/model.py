@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from .config import ModelConfig
 from .checkpointing import checkpoint_block
-from .layers.attention import LayerCache
+from .layers.attention import DocMask, LayerCache
 from .layers.block import Block
 from .layers.engram import EngramMemory
 from .layers.hyper import HyperConnections
@@ -46,7 +46,8 @@ class LanguageModel(nn.Module):
         self.embed_norm = RMSNorm(cfg.dim)
         self.memory = None
         if cfg.engram_orders:
-            self.memory = EngramMemory(cfg.vocab_size, cfg.engram_orders, cfg.engram_heads, cfg.engram_head_dim, cfg.engram_rows)
+            self.memory = EngramMemory(cfg.vocab_size, cfg.engram_orders, cfg.engram_heads, cfg.engram_head_dim, cfg.engram_rows,
+                                       doc_eos=cfg.doc_eos)
             # 每个阶数的记忆各自投影成一份「来源」，和词向量一起交给入口
             self.memory_proj = nn.ModuleList(nn.Linear(cfg.engram_heads * cfg.engram_head_dim, cfg.dim, bias=False) for _ in cfg.engram_orders)
             self.memory_norms = nn.ModuleList(RMSNorm(cfg.dim) for _ in cfg.engram_orders)
@@ -59,6 +60,11 @@ class LanguageModel(nn.Module):
         cos, sin = rotary_tables(cfg.head_dim, cfg.max_seq_len, cfg.rope_base)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
+        # 看全文的层单独用一个底数时，另建一份表；没设就和局部层共用
+        if cfg.global_rope_base and cfg.global_rope_base != cfg.rope_base:
+            cos, sin = rotary_tables(cfg.head_dim, cfg.max_seq_len, cfg.global_rope_base)
+        self.register_buffer("rope_cos_long", cos, persistent=False)
+        self.register_buffer("rope_sin_long", sin, persistent=False)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -70,6 +76,8 @@ class LanguageModel(nn.Module):
             leaf = name.rsplit(".", 2)[-2] if name.endswith(".weight") else name.rsplit(".", 1)[-1]
             if name in ("embed.weight", "memory.table.weight"):
                 nn.init.normal_(p, std=1.0)
+            elif leaf == "sink":
+                nn.init.zeros_(p)  # 起步时虚拟键和其他键同等地位，由训练决定每个头要不要用它
             elif name == "head.weight":
                 nn.init.normal_(p, std=0.001)
             elif leaf in ("proj", "value") or ".w_out." in name or name.endswith(".w_out") or (leaf == "up" and "ffn" in name):
@@ -91,6 +99,9 @@ class LanguageModel(nn.Module):
         if pos + T > self.cfg.max_seq_len:
             raise ValueError(f"序列长度 {pos + T} 超过了上限 {self.cfg.max_seq_len}")
         cos, sin = self.rope_cos[pos:pos + T], self.rope_sin[pos:pos + T]
+        long_cos, long_sin = self.rope_cos_long[pos:pos + T], self.rope_sin_long[pos:pos + T]
+        # 文档掩码：结束符算下一篇的第一个词，所以「第几篇」就是到这个位置为止（含）出现过几个结束符。逐词生成时不用。
+        docs = DocMask((idx == self.cfg.doc_eos).cumsum(1)) if self.cfg.doc_eos >= 0 and state is None else None
 
         sources, memory = [self.embed_norm(self.embed(idx))], None
         if self.memory is not None:
@@ -102,12 +113,13 @@ class LanguageModel(nn.Module):
         maps = self.hyper.mappings(x.dtype)
         balance = x.new_zeros((), dtype=torch.float32)
         for i, block in enumerate(self.blocks):
+            c, s = (long_cos, long_sin) if block.long else (cos, sin)
             # 带生成缓存时不能重算。MoE 的路由偏置不在前向里改（见 lm/layers/moe.py），重算时挑的专家不变，可以照常重算。
             if self.gradient_checkpointing and self.training and torch.is_grad_enabled() and state is None:
                 layer_maps = tuple(m[2 * i:2 * i + 2] for m in maps)
-                x, b = self.checkpoint_block(block, x, cos, sin, layer_maps, memory, self.checkpoint_policy)
+                x, b = self.checkpoint_block(block, x, c, s, layer_maps, memory, self.checkpoint_policy, docs)
             else:
-                x, b = block(x, cos, sin, maps, memory, state.layers[i] if state is not None else None)
+                x, b = block(x, c, s, maps, memory, state.layers[i] if state is not None else None, docs=docs)
             balance = balance + b.float()
         balance = self.cfg.moe_balance_loss * balance
 

@@ -17,7 +17,8 @@ class Block(nn.Module):
         super().__init__()
         self.index = index
         self.engram = EngramGate(cfg.engram_dim, cfg.dim, cfg.n_streams) if index in cfg.engram_layers else None
-        self.attn = Attention(cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.window_of(index))
+        self.long = cfg.is_long(index)  # 看全文的层：位置编码可以单独设置（global_rope、global_rope_base）
+        self.attn = Attention(cfg.dim, cfg.n_heads, cfg.n_kv_heads, cfg.window_of(index), rope=cfg.uses_rope(index), sink=cfg.attn_sink)
         self.attn_norm, self.ffn_norm = RMSNorm(cfg.dim), RMSNorm(cfg.dim)
         if cfg.is_moe_layer(index):
             self.ffn = MoE(cfg.dim, cfg.moe_experts, cfg.moe_top_k, int(cfg.moe_hidden_mult * cfg.dim), int(cfg.moe_shared_mult * cfg.dim),
@@ -25,13 +26,14 @@ class Block(nn.Module):
         else:
             self.ffn = FeedForward(cfg.dim, int(cfg.ffn_mult * cfg.dim))
 
-    def forward(self, x, cos, sin, maps, memory=None, cache: LayerCache | None = None, return_counts=False):
-        """maps 可传全模型的系数，或只传这一层的两组系数。return_counts 时额外返回本层的命中数。"""
+    def forward(self, x, cos, sin, maps, memory=None, cache: LayerCache | None = None, return_counts=False, docs=None):
+        """maps 可传全模型的系数，或只传这一层的两组系数。return_counts 时额外返回本层的命中数。
+        docs 是 DocMask（每个位置属于哪篇文档），只在开了 doc_eos 时传。"""
         pre, post, res = maps
         a, f = (0, 1) if pre.size(0) == 2 else (2 * self.index, 2 * self.index + 1)
         if self.engram is not None:
             x = self.engram(x, memory)
-        x = write_streams(x, self.attn(read_normalized_streams(x, pre[a], self.attn_norm), cos, sin, cache), res[a], post[a])
+        x = write_streams(x, self.attn(read_normalized_streams(x, pre[a], self.attn_norm), cos, sin, cache, docs), res[a], post[a])
         value = read_normalized_streams(x, pre[f], self.ffn_norm)
         counts = None
         if isinstance(self.ffn, MoE):

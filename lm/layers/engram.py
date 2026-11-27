@@ -26,9 +26,11 @@ def primes_below(limit: int, count: int) -> list[int]:
 class EngramMemory(nn.Module):
     """查表部分。forward 返回 (B, T, 阶数, 头数×头宽)，已经归一化。"""
 
-    def __init__(self, vocab_size: int, orders: tuple, heads: int, head_dim: int, rows: int, seed: int = 0):
+    def __init__(self, vocab_size: int, orders: tuple, heads: int, head_dim: int, rows: int, seed: int = 0, doc_eos: int = -1):
         super().__init__()
         self.orders, self.heads, self.pad_id = tuple(orders), heads, vocab_size
+        # doc_eos ≥ 0：结束符算下一篇文档的第一个词，n-gram 里属于上一篇文档的词换成「空」（和序列开头一样），不跨文档查表
+        self.doc_eos = doc_eos
         sizes = torch.tensor(primes_below(rows, len(orders) * heads)).view(len(orders), heads)
         gen = torch.Generator().manual_seed(seed)
         # 乘数是奇数且小于 2^31，词表小于 2^31，乘积不会超出 64 位整数
@@ -50,11 +52,15 @@ class EngramMemory(nn.Module):
         if history is None:
             history = idx.new_full((B, m), self.pad_id)
         ctx = torch.cat([history[:, -m:], idx], dim=1)  # (B, m+T)
+        doc = (ctx == self.doc_eos).cumsum(1) if self.doc_eos >= 0 else None  # 每个位置属于第几篇文档
         out = []
         for o, n in enumerate(self.orders):
             h = torch.zeros(B, T, self.heads, dtype=torch.long, device=idx.device)
             for j in range(n):  # j=0 是当前词，j=1 是前一个词……
-                h = h ^ (ctx[:, m - j: m - j + T, None] * self.mult[o, :, j])
+                word = ctx[:, m - j: m - j + T]
+                if doc is not None and j:
+                    word = torch.where(doc[:, m - j: m - j + T] == doc[:, m: m + T], word, self.pad_id)
+                h = h ^ (word[:, :, None] * self.mult[o, :, j])
             out.append(h % self.sizes[o] + self.offsets[o])
         return torch.stack(out, dim=2)
 

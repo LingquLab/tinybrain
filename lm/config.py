@@ -48,6 +48,16 @@ class ModelConfig:
     moe_clip: float = 0.0         # MoE 内共享和路由专家的 ReLU 正半轴上限，0 关闭
     engram_sparse_share: float = ENGRAM_SPARSE_SHARE
 
+    # 文档边界：doc_eos ≥ 0 时，这个词（预训练数据里每篇文档后面接的结束符）算作下一篇文档的第一个词。
+    # 注意力只看同一篇文档里的词，Engram 的 n-gram 也不跨过它。-1 关闭（老行为：拼在一起的文档互相看得见）。
+    doc_eos: int = -1
+    # 看全文的那些层（每 long_every 层的最后一层）用什么位置编码：rope 和局部层一样，nope 不加位置编码。
+    # global_rope_base 大于 0 时，这些层的旋转位置编码改用这个底数（局部层仍用 rope_base）。
+    global_rope: str = "rope"
+    global_rope_base: float = 0.0
+    # 注意力 sink：每个头一个可学的分数，相当于多了一个值为 0 的虚拟键，这个头可以「哪里都不看」（gpt-oss、DeepSeek-V4 的做法）
+    attn_sink: bool = False
+
     def __post_init__(self):
         object.__setattr__(self, "engram_orders", tuple(self.engram_orders))
         object.__setattr__(self, "engram_layers", tuple(self.engram_layers) if self.engram_orders else ())
@@ -72,6 +82,10 @@ class ModelConfig:
             problems.append(f"moe_dense_layers={self.moe_dense_layers} 要在 0 和 n_layers={self.n_layers} 之间（至少留一层 MoE）")
         if not 0 <= self.moe_clip < float("inf") or not 0 < self.engram_sparse_share < 1:
             problems.append("moe_clip 应为非负有限值，engram_sparse_share 应在 (0, 1) 内")
+        if not -1 <= self.doc_eos < self.vocab_size:
+            problems.append(f"doc_eos={self.doc_eos} 要么是 -1（关闭），要么是词表里的一个词（小于 {self.vocab_size}）")
+        if self.global_rope not in ("rope", "nope") or self.global_rope_base < 0:
+            problems.append(f"global_rope 只能是 rope 或 nope（收到 {self.global_rope!r}），global_rope_base 不能是负数")
         if problems:
             raise ValueError("模型配置有问题：" + "；".join(problems))
 
@@ -84,10 +98,17 @@ class ModelConfig:
         """一个位置上取回的全部记忆向量拼起来的宽度。"""
         return len(self.engram_orders) * self.engram_heads * self.engram_head_dim
 
+    def is_long(self, layer: int) -> bool:
+        """第 layer 层是不是按设计看全文的那种层（每 long_every 层的最后一层，以及最后一层）。"""
+        return layer % self.long_every == self.long_every - 1 or layer == self.n_layers - 1
+
     def window_of(self, layer: int) -> int | None:
         """第 layer 层的注意力范围；None 表示看全文。"""
-        long = layer % self.long_every == self.long_every - 1 or layer == self.n_layers - 1
-        return None if long or self.window >= self.max_seq_len else self.window
+        return None if self.is_long(layer) or self.window >= self.max_seq_len else self.window
+
+    def uses_rope(self, layer: int) -> bool:
+        """第 layer 层加不加旋转位置编码：只有 global_rope=nope 时，看全文的层不加。"""
+        return not (self.global_rope == "nope" and self.is_long(layer))
 
     def is_moe_layer(self, layer: int) -> bool:
         return bool(self.moe_experts) and layer >= self.moe_dense_layers
@@ -119,6 +140,7 @@ class ModelConfig:
         # 记忆表后一组；每处注入两组
         total += self.n_layers * (2 * d + 2 * self.head_dim) + (3 + len(self.engram_orders)) * d + 2 * self.stream_key_dim
         total += (self.engram_heads * self.engram_head_dim if self.engram_orders else 0) + len(self.engram_layers) * 2 * d
+        total += self.n_layers * self.n_heads if self.attn_sink else 0              # 每层每个头一个 sink 分数
         return total
 
     def with_engram_share(self, share: float) -> "ModelConfig":

@@ -20,11 +20,12 @@ def _policy(ctx, op, *args, **kwargs):
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 
-def checkpoint_block(block, x, cos, sin, maps, memory, policy="full"):
+def checkpoint_block(block, x, cos, sin, maps, memory, policy="full", docs=None):
     options = {}
     if policy == "selective":
         options["context_fn"] = functools.partial(create_selective_checkpoint_contexts, _policy)
-    x, loss, counts = checkpoint(block, x, cos, sin, maps, memory, return_counts=True,
+    # docs（文档掩码）在前向和重算之间共用同一个对象，块掩码只建一次
+    x, loss, counts = checkpoint(block, x, cos, sin, maps, memory, return_counts=True, docs=docs,
                                  use_reentrant=False, **options)
     # 重算只会再次调用 block，不会执行下面这次记账。
     if counts is not None:
